@@ -1,17 +1,136 @@
-"""
-Script Generator - Uses an LLM to generate podcast scripts
-based on the topic and target BPM energy level.
+"""Script Generator - Uses an LLM to generate podcast scripts.
+
+Supports OpenAI, Ollama, and OpenRouter via a unified dispatch.
+Each operation type (script gen, follow-up, summary) has one entry
+point that delegates to a shared provider client.
 """
 
 import json
-import os
-from typing import Optional
+from typing import Any, Optional
+
 from . import config
 
 
-def _get_prompt(topic: str, bpm: int, duration_minutes: int = 5) -> str:
+# ---------------------------------------------------------------------------
+# Shared LLM client wrappers
+# ---------------------------------------------------------------------------
+
+
+def _call_openai(
+    system_prompt: str,
+    user_prompt: str,
+    api_key: Optional[str] = None,
+    model: Optional[str] = None,
+    temperature: float = 0.8,
+    base_url: Optional[str] = None,
+) -> dict[str, Any]:
+    """Call OpenAI-compatible API and return parsed JSON response."""
+    from openai import OpenAI
+
+    key = api_key or config.OPENAI_API_KEY
+    if not key and not base_url:
+        raise ValueError(
+            "OpenAI API key not set. Set PODCAST_OPENAI_API_KEY env var "
+            "or pass api_key."
+        )
+
+    model_name = model or config.OPENAI_MODEL
+    client_kwargs: dict[str, Any] = {"api_key": key}
+    if base_url:
+        client_kwargs["base_url"] = base_url
+
+    client = OpenAI(**client_kwargs)
+    extra_kwargs: dict[str, Any] = {"temperature": temperature}
+
+    # OpenAI native responses use response_format; others use extra_headers
+    if base_url:
+        extra_kwargs["extra_headers"] = {
+            "HTTP-Referer": "https://github.com/straub-ah",
+            "X-Title": "BPM Podcast Generator",
+        }
+    else:
+        extra_kwargs["response_format"] = {"type": "json_object"}
+
+    response = client.chat.completions.create(
+        model=model_name,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        **extra_kwargs,
+    )
+
+    text = response.choices[0].message.content
+    # Some routers (OpenRouter) wrap JSON in markdown fences
+    text = text.strip()
+    if text.startswith("```"):
+        text = text.split("\n", 1)[1]
+        text = text.rsplit("```", 1)[0]
+    return json.loads(text.strip())
+
+
+def _call_ollama(
+    system_prompt: str,
+    user_prompt: str,
+    base_url: Optional[str] = None,
+    model: Optional[str] = None,
+) -> dict[str, Any]:
+    """Call Ollama API and return parsed JSON response."""
+    import requests
+
+    url = base_url or config.OLLAMA_BASE_URL
+    model_name = model or config.OLLAMA_MODEL
+    prompt = f"{system_prompt}\n\n{user_prompt}"
+
+    resp = requests.post(
+        f"{url}/api/generate",
+        json={
+            "model": model_name,
+            "prompt": prompt,
+            "stream": False,
+            "format": "json",
+        },
+        timeout=120,
+    )
+    resp.raise_for_status()
+    return json.loads(resp.json()["response"])
+
+
+def _call_provider(
+    system_prompt: str,
+    user_prompt: str,
+    provider: Optional[str] = None,
+    api_key: Optional[str] = None,
+    model: Optional[str] = None,
+    temperature: float = 0.8,
+) -> dict[str, Any]:
+    """Unified dispatch: route to the right provider and return parsed JSON."""
+    provider = provider or config.LLM_PROVIDER
+
+    if provider == "openai":
+        return _call_openai(system_prompt, user_prompt, api_key, model, temperature)
+    elif provider == "ollama":
+        return _call_ollama(system_prompt, user_prompt, model=model)
+    elif provider == "openrouter":
+        return _call_openai(
+            system_prompt,
+            user_prompt,
+            api_key=api_key,
+            model=model or config.OPENROUTER_MODEL,
+            temperature=temperature,
+            base_url=config.OPENROUTER_BASE_URL,
+        )
+    else:
+        raise ValueError(f"Unknown LLM provider: {provider}")
+
+
+# ---------------------------------------------------------------------------
+# Prompt builders
+# ---------------------------------------------------------------------------
+
+
+def _get_script_prompt(topic: str, bpm: int, duration_minutes: int = 5) -> str:
     """Build the prompt for the LLM."""
-    # Map BPM to energy level
     if bpm >= 160:
         energy = "HIGH ENERGY"
         pace = "fast-paced, punchy, exciting — like a workout hype session"
@@ -69,153 +188,6 @@ Each content segment should be 30-60 seconds of natural speech.
 """
 
 
-def generate_script_openai(
-    topic: str,
-    bpm: int,
-    duration_minutes: int = 5,
-    api_key: Optional[str] = None,
-    model: Optional[str] = None,
-) -> dict:
-    """Generate a podcast script using OpenAI."""
-    try:
-        from openai import OpenAI
-    except ImportError:
-        raise ImportError("openai package not installed. Run: pip install openai")
-
-    key = api_key or config.OPENAI_API_KEY
-    if not key:
-        raise ValueError(
-            "OpenAI API key not set. Set it in config.py or pass it via --openai-key"
-        )
-
-    model_name = model or config.OPENAI_MODEL
-    client = OpenAI(api_key=key)
-
-    prompt = _get_prompt(topic, bpm, duration_minutes)
-
-    response = client.chat.completions.create(
-        model=model_name,
-        messages=[
-            {
-                "role": "system",
-                "content": "You are a podcast script writer. You output raw JSON only.",
-            },
-            {"role": "user", "content": prompt},
-        ],
-        response_format={"type": "json_object"},
-        temperature=0.8,
-    )
-
-    raw = response.choices[0].message.content
-    return json.loads(raw)
-
-
-def generate_script_ollama(
-    topic: str,
-    bpm: int,
-    duration_minutes: int = 5,
-    base_url: Optional[str] = None,
-    model: Optional[str] = None,
-) -> dict:
-    """Generate a podcast script using Ollama (local LLM)."""
-    import requests
-
-    url = base_url or config.OLLAMA_BASE_URL
-    model_name = model or config.OLLAMA_MODEL
-    prompt = _get_prompt(topic, bpm, duration_minutes)
-
-    payload = {
-        "model": model_name,
-        "prompt": prompt,
-        "stream": False,
-        "format": "json",
-    }
-
-    resp = requests.post(f"{url}/api/generate", json=payload, timeout=120)
-    resp.raise_for_status()
-    data = resp.json()
-    return json.loads(data["response"])
-
-
-def generate_script_openrouter(
-    topic: str,
-    bpm: int,
-    duration_minutes: int = 5,
-    api_key: Optional[str] = None,
-    model: Optional[str] = None,
-) -> dict:
-    """Generate a podcast script using OpenRouter (400+ models)."""
-    key = api_key or config.OPENROUTER_API_KEY
-    if not key:
-        raise ValueError(
-            "OpenRouter API key required. Set OPENROUTER_API_KEY env var."
-        )
-
-    try:
-        from openai import OpenAI
-    except ImportError:
-        raise ImportError("openai package not installed. Run: pip install openai")
-
-    model_name = model or config.OPENROUTER_MODEL
-    client = OpenAI(api_key=key, base_url=config.OPENROUTER_BASE_URL)
-    prompt = _get_prompt(topic, bpm, duration_minutes)
-
-    response = client.chat.completions.create(
-        model=model_name,
-        messages=[
-            {
-                "role": "system",
-                "content": "You are a podcast script writer. You output raw JSON only.",
-            },
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0.7,
-        extra_headers={
-            "HTTP-Referer": "https://github.com/straub-ah",
-            "X-Title": "BPM Podcast Generator",
-        },
-    )
-
-    text = response.choices[0].message.content
-    # OpenRouter may return JSON wrapped in markdown fences
-    text = text.strip()
-    if text.startswith("```"):
-        text = text.split("\n", 1)[1]
-        text = text.rsplit("```", 1)[0]
-    return json.loads(text.strip())
-
-
-def generate_script(
-    topic: str,
-    bpm: int,
-    duration_minutes: int = 5,
-    provider: Optional[str] = None,
-    **kwargs,
-) -> dict:
-    """Generate a podcast script using the configured LLM provider."""
-    provider = provider or config.LLM_PROVIDER
-
-    if provider == "openai":
-        return generate_script_openai(topic, bpm, duration_minutes, **kwargs)
-    elif provider == "ollama":
-        return generate_script_ollama(topic, bpm, duration_minutes, **kwargs)
-    elif provider == "openrouter":
-        return generate_script_openrouter(topic=topic, bpm=bpm, duration_minutes=duration_minutes, **kwargs)
-    else:
-        raise ValueError(f"Unknown LLM provider: {provider}")
-
-
-def flatten_script(script: dict) -> str:
-    """Flatten a script dict into a single text string for TTS."""
-    segments = script.get("segments", [])
-    return " ".join(seg["text"] for seg in segments)
-
-
-# ---------------------------------------------------------------------------
-# Follow-up questions
-# ---------------------------------------------------------------------------
-
-
 def _get_follow_up_prompt(topic: str, script: dict) -> str:
     """Build a prompt that asks the LLM to generate follow-up questions."""
     full_text = flatten_script(script)
@@ -247,128 +219,6 @@ Return ONLY valid JSON with this exact structure:
 """
 
 
-def generate_follow_up_questions(
-    topic: str,
-    script: dict,
-    provider: Optional[str] = None,
-    **kwargs,
-) -> dict:
-    """Generate follow-up questions based on a podcast script.
-
-    Args:
-        topic: The original podcast topic.
-        script: The generated script dict (with 'title' and 'segments').
-        provider: LLM provider ('openai', 'ollama', or 'openrouter').
-        **kwargs: Additional args passed through (api_key, model, etc.)
-
-    Returns:
-        dict with a 'follow_up_questions' list.
-    """
-    provider = provider or config.LLM_PROVIDER
-
-    if provider == "openai":
-        return _generate_follow_up_openai(topic, script, **kwargs)
-    elif provider == "ollama":
-        return _generate_follow_up_ollama(topic, script, **kwargs)
-    elif provider == "openrouter":
-        return _generate_follow_up_openrouter(topic, script, **kwargs)
-    else:
-        raise ValueError(f"Unknown LLM provider: {provider}")
-
-
-def _generate_follow_up_openai(
-    topic: str,
-    script: dict,
-    api_key: Optional[str] = None,
-    model: Optional[str] = None,
-) -> dict:
-    """Generate follow-up questions via OpenAI."""
-    from openai import OpenAI
-
-    key = api_key or config.OPENAI_API_KEY
-    if not key:
-        raise ValueError("OpenAI API key not set.")
-
-    model_name = model or config.OPENAI_MODEL
-    client = OpenAI(api_key=key)
-    prompt = _get_follow_up_prompt(topic, script)
-
-    response = client.chat.completions.create(
-        model=model_name,
-        messages=[
-            {"role": "system", "content": "You generate follow-up questions in JSON format only."},
-            {"role": "user", "content": prompt},
-        ],
-        response_format={"type": "json_object"},
-        temperature=0.8,
-    )
-    return json.loads(response.choices[0].message.content)
-
-
-def _generate_follow_up_ollama(
-    topic: str,
-    script: dict,
-    base_url: Optional[str] = None,
-    model: Optional[str] = None,
-) -> dict:
-    """Generate follow-up questions via Ollama."""
-    import requests
-
-    url = base_url or config.OLLAMA_BASE_URL
-    model_name = model or config.OLLAMA_MODEL
-    prompt = _get_follow_up_prompt(topic, script)
-
-    resp = requests.post(
-        f"{url}/api/generate",
-        json={"model": model_name, "prompt": prompt, "stream": False, "format": "json"},
-        timeout=120,
-    )
-    resp.raise_for_status()
-    return json.loads(resp.json()["response"])
-
-
-def _generate_follow_up_openrouter(
-    topic: str,
-    script: dict,
-    api_key: Optional[str] = None,
-    model: Optional[str] = None,
-) -> dict:
-    """Generate follow-up questions via OpenRouter."""
-    from openai import OpenAI
-
-    key = api_key or config.OPENROUTER_API_KEY
-    if not key:
-        raise ValueError("OpenRouter API key not set.")
-
-    model_name = model or config.OPENROUTER_MODEL
-    client = OpenAI(api_key=key, base_url=config.OPENROUTER_BASE_URL)
-    prompt = _get_follow_up_prompt(topic, script)
-
-    response = client.chat.completions.create(
-        model=model_name,
-        messages=[
-            {"role": "system", "content": "You generate follow-up questions in JSON format only."},
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0.8,
-        extra_headers={
-            "HTTP-Referer": "https://github.com/straub-ah",
-            "X-Title": "BPM Podcast Generator",
-        },
-    )
-
-    text = response.choices[0].message.content.strip()
-    if text.startswith("```"):
-        text = text.split("\n", 1)[1]
-        text = text.rsplit("```", 1)[0]
-    return json.loads(text.strip())
-
-
-# ---------------------------------------------------------------------------
-# Script summary
-# ---------------------------------------------------------------------------
-
-
 def _get_summary_prompt(script: dict) -> str:
     """Build a prompt that asks the LLM to summarize a podcast script."""
     full_text = flatten_script(script)
@@ -396,6 +246,60 @@ Return ONLY valid JSON with this exact structure:
 """
 
 
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+
+def generate_script(
+    topic: str,
+    bpm: int,
+    duration_minutes: int = 5,
+    provider: Optional[str] = None,
+    **kwargs,
+) -> dict:
+    """Generate a podcast script using the configured LLM provider."""
+    prompt = _get_script_prompt(topic, bpm, duration_minutes)
+    return _call_provider(
+        "You are a podcast script writer. You output raw JSON only.",
+        prompt,
+        provider=provider,
+        **kwargs,
+    )
+
+
+def flatten_script(script: dict) -> str:
+    """Flatten a script dict into a single text string for TTS."""
+    segments = script.get("segments", [])
+    return " ".join(seg["text"] for seg in segments)
+
+
+def generate_follow_up_questions(
+    topic: str,
+    script: dict,
+    provider: Optional[str] = None,
+    **kwargs,
+) -> dict:
+    """Generate follow-up questions based on a podcast script.
+
+    Args:
+        topic: The original podcast topic.
+        script: The generated script dict (with 'title' and 'segments').
+        provider: LLM provider ('openai', 'ollama', or 'openrouter').
+        **kwargs: Additional args passed through (api_key, model, etc.)
+
+    Returns:
+        dict with a 'follow_up_questions' list.
+    """
+    prompt = _get_follow_up_prompt(topic, script)
+    return _call_provider(
+        "You generate follow-up questions in JSON format only.",
+        prompt,
+        provider=provider,
+        **kwargs,
+    )
+
+
 def generate_script_summary(
     script: dict,
     provider: Optional[str] = None,
@@ -411,98 +315,11 @@ def generate_script_summary(
     Returns:
         dict with 'summary', 'key_points', and 'key_takeaway'.
     """
-    provider = provider or config.LLM_PROVIDER
-
-    if provider == "openai":
-        return _generate_summary_openai(script, **kwargs)
-    elif provider == "ollama":
-        return _generate_summary_ollama(script, **kwargs)
-    elif provider == "openrouter":
-        return _generate_summary_openrouter(script, **kwargs)
-    else:
-        raise ValueError(f"Unknown LLM provider: {provider}")
-
-
-def _generate_summary_openai(
-    script: dict,
-    api_key: Optional[str] = None,
-    model: Optional[str] = None,
-) -> dict:
-    """Generate a script summary via OpenAI."""
-    from openai import OpenAI
-
-    key = api_key or config.OPENAI_API_KEY
-    if not key:
-        raise ValueError("OpenAI API key not set.")
-
-    model_name = model or config.OPENAI_MODEL
-    client = OpenAI(api_key=key)
     prompt = _get_summary_prompt(script)
-
-    response = client.chat.completions.create(
-        model=model_name,
-        messages=[
-            {"role": "system", "content": "You generate summaries in JSON format only."},
-            {"role": "user", "content": prompt},
-        ],
-        response_format={"type": "json_object"},
+    return _call_provider(
+        "You generate summaries in JSON format only.",
+        prompt,
+        provider=provider,
         temperature=0.5,
+        **kwargs,
     )
-    return json.loads(response.choices[0].message.content)
-
-
-def _generate_summary_ollama(
-    script: dict,
-    base_url: Optional[str] = None,
-    model: Optional[str] = None,
-) -> dict:
-    """Generate a script summary via Ollama."""
-    import requests
-
-    url = base_url or config.OLLAMA_BASE_URL
-    model_name = model or config.OLLAMA_MODEL
-    prompt = _get_summary_prompt(script)
-
-    resp = requests.post(
-        f"{url}/api/generate",
-        json={"model": model_name, "prompt": prompt, "stream": False, "format": "json"},
-        timeout=120,
-    )
-    resp.raise_for_status()
-    return json.loads(resp.json()["response"])
-
-
-def _generate_summary_openrouter(
-    script: dict,
-    api_key: Optional[str] = None,
-    model: Optional[str] = None,
-) -> dict:
-    """Generate a script summary via OpenRouter."""
-    from openai import OpenAI
-
-    key = api_key or config.OPENROUTER_API_KEY
-    if not key:
-        raise ValueError("OpenRouter API key not set.")
-
-    model_name = model or config.OPENROUTER_MODEL
-    client = OpenAI(api_key=key, base_url=config.OPENROUTER_BASE_URL)
-    prompt = _get_summary_prompt(script)
-
-    response = client.chat.completions.create(
-        model=model_name,
-        messages=[
-            {"role": "system", "content": "You generate summaries in JSON format only."},
-            {"role": "user", "content": prompt},
-        ],
-        temperature=0.5,
-        extra_headers={
-            "HTTP-Referer": "https://github.com/straub-ah",
-            "X-Title": "BPM Podcast Generator",
-        },
-    )
-
-    text = response.choices[0].message.content.strip()
-    if text.startswith("```"):
-        text = text.split("\n", 1)[1]
-        text = text.rsplit("```", 1)[0]
-    return json.loads(text.strip())
