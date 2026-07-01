@@ -8,7 +8,7 @@ import os
 import tempfile
 from typing import Optional
 
-import config
+from . import config
 
 
 def _split_into_chunks(text: str, max_chars: int = 3000) -> list:

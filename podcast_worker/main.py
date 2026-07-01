@@ -1,5 +1,4 @@
-"""
-FastAPI application for the Podcast Worker Service.
+"""FastAPI application for the Podcast Worker Service.
 
 Endpoints:
   POST /api/services/generate          — Full pipeline (async, returns job_id)
@@ -10,31 +9,96 @@ Endpoints:
   POST /api/services/generate-beat     — Beat generation only (sync)
   GET  /api/services/health            — Health check
   GET  /api/services/config            — Available providers, voices, models
+  POST /api/services/scripts           — Generate and store a script
+  GET  /api/services/scripts           — List stored scripts
+  GET  /api/services/scripts/{id}      — Retrieve a stored script
+  POST /api/services/scripts/{id}/follow-up — Generate follow-up questions
+  POST /api/services/scripts/{id}/summary   — Generate script summary
 
 The iOS app uses PodcastServiceClient to talk to this service.
 """
 
 import json
 import os
-import sys
 import threading
 import time
 import uuid
-from datetime import datetime, timezone
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
-from pydantic import BaseModel, Field
 
-# Import core modules from inside the worker package
-from .core import config as cfg
-from .core.script_generator import generate_script, flatten_script
-from .core.tts_engine import synthesize, convert_to_wav
-from .core.beat_generator import save_beat_to_wav, generate_beat
-from .core.audio_mixer import build_podcast_audio, convert_to_mp3
+# Import core modules
+from podcast_worker.core import config as cfg
+from podcast_worker.core.exceptions import (
+    PodcastWorkerError,
+    ConfigurationError,
+    JobNotFoundError,
+    JobNotCompleteError,
+    ScriptNotFoundError,
+)
+from podcast_worker.core.models import (
+    AudioRequest,
+    BeatRequest,
+    FollowUpRequest,
+    GenerateRequest,
+    HealthResponse,
+    JobStatusResponse,
+    OverlayRequest,
+    ScriptRequest as ScriptRequestModel,
+    ScriptStoreRequest,
+    SpeechRequest,
+    SummaryRequest,
+)
+from podcast_worker.core.script_generator import (
+    generate_script,
+    flatten_script,
+    generate_follow_up_questions,
+    generate_script_summary,
+)
+from podcast_worker.core.tts_engine import synthesize, convert_to_wav
+from podcast_worker.core.beat_generator import save_beat_to_wav, generate_beat
+from podcast_worker.core.audio_mixer import build_podcast_audio, convert_to_mp3
+
+# ---------------------------------------------------------------------------
+# Application state
+# ---------------------------------------------------------------------------
+
+class AppState:
+    """Shared mutable state for the FastAPI application."""
+
+    def __init__(self) -> None:
+        self.start_time: float = 0.0
+        # In-memory job store; for production use Redis or a DB
+        self.jobs: dict[str, dict] = {}
+        # In-memory script store
+        self.scripts: dict[str, dict] = {}
+        # Default output directory
+        project_root = Path(__file__).resolve().parent.parent
+        self.output_dir = project_root / "output"
+
+
+state = AppState()
+
+
+# ---------------------------------------------------------------------------
+# Lifespan
+# ---------------------------------------------------------------------------
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
+    """Application lifespan — startup/shutdown logic."""
+    state.start_time = time.time()
+    state.output_dir.mkdir(parents=True, exist_ok=True)
+    yield
+    # Cleanup on shutdown (if needed)
+
 
 # ---------------------------------------------------------------------------
 # App
@@ -44,101 +108,33 @@ app = FastAPI(
     title="Straub AH — Podcast Worker Service",
     version="2.0.0",
     description="Heavy-lift service for script generation, TTS, beat generation, and audio mixing.",
+    lifespan=lifespan,
 )
 
+# CORS — configurable via PODCAST_CORS_ORIGINS env var
+_cors_origins = cfg.CORS_ORIGINS.split(",") if cfg.CORS_ORIGINS != "*" else ["*"]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # ---------------------------------------------------------------------------
-# Job store (in-memory; for production use Redis or a DB)
-# ---------------------------------------------------------------------------
-jobs: dict[str, dict] = {}
-
-# Default output directory for generated files
-_project_root = Path(__file__).resolve().parent.parent
-DEFAULT_OUTPUT_DIR = _project_root / "output"
-DEFAULT_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-# ---------------------------------------------------------------------------
-# Pydantic models
+# Helpers
 # ---------------------------------------------------------------------------
 
 
-class ScriptRequest(BaseModel):
-    topic: str = Field(..., min_length=1)
-    bpm: int = Field(..., ge=cfg.MIN_BPM, le=cfg.MAX_BPM)
-    duration_minutes: int = Field(default=5, ge=1, le=30)
-    provider: Optional[str] = None
-    api_key: Optional[str] = None
-    model: Optional[str] = None
-    openrouter_key: Optional[str] = None
+def _resolve_llm_key(req, provider_field: str = "provider") -> Optional[str]:
+    """Resolve the LLM API key, handling OpenRouter special case."""
+    provider = getattr(req, provider_field, None)
+    api_key = getattr(req, "api_key", None)
+    openrouter_key = getattr(req, "openrouter_key", None)
 
-
-class AudioRequest(BaseModel):
-    speech_text: str = Field(..., min_length=1)
-    bpm: int = Field(..., ge=cfg.MIN_BPM, le=cfg.MAX_BPM)
-    duration_minutes: int = Field(default=5, ge=1, le=30)
-    tts_provider: Optional[str] = None
-    voice: Optional[str] = None
-    api_key: Optional[str] = None
-    openrouter_key: Optional[str] = None
-    tts_model: Optional[str] = None
-
-
-class GenerateRequest(BaseModel):
-    topic: str = Field(..., min_length=1)
-    bpm: int = Field(..., ge=cfg.MIN_BPM, le=cfg.MAX_BPM)
-    duration_minutes: int = Field(default=5, ge=1, le=30)
-    llm_provider: Optional[str] = None
-    tts_provider: Optional[str] = None
-    voice: Optional[str] = None
-    llm_model: Optional[str] = None
-    tts_model: Optional[str] = None
-    api_key: Optional[str] = None
-    openrouter_key: Optional[str] = None
-
-
-class BeatRequest(BaseModel):
-    bpm: int = Field(..., ge=cfg.MIN_BPM, le=cfg.MAX_BPM)
-    duration_seconds: float = Field(..., gt=0)
-
-
-class SpeechRequest(BaseModel):
-    """Request for TTS-only generation (no beat, no mix)."""
-    speech_text: str = Field(..., min_length=1)
-    tts_provider: Optional[str] = None
-    voice: Optional[str] = None
-    api_key: Optional[str] = None
-    openrouter_key: Optional[str] = None
-    tts_model: Optional[str] = None
-
-
-class OverlayRequest(BaseModel):
-    """Request to overlay pre-generated speech and beat WAVs."""
-    bpm: int = Field(..., ge=cfg.MIN_BPM, le=cfg.MAX_BPM)
-    duration_minutes: int = Field(default=5, ge=1, le=30)
-    intro_seconds: float = Field(default=4.0, ge=0)
-    outro_seconds: float = Field(default=6.0, ge=0)
-
-
-class JobStatusResponse(BaseModel):
-    job_id: str
-    status: str  # "pending" | "running" | "completed" | "failed"
-    progress: Optional[str] = None
-    error: Optional[str] = None
-    created_at: str
-    completed_at: Optional[str] = None
-
-
-class HealthResponse(BaseModel):
-    status: str
-    version: str
-    uptime: float
+    if provider == "openrouter":
+        return openrouter_key or os.environ.get("OPENROUTER_API_KEY", "")
+    return api_key
 
 
 # ---------------------------------------------------------------------------
@@ -148,14 +144,12 @@ class HealthResponse(BaseModel):
 
 def _run_full_generation(job_id: str, req: GenerateRequest):
     """Run the full generation pipeline in a background thread."""
-    jobs[job_id]["status"] = "running"
+    state.jobs[job_id]["status"] = "running"
     try:
-        jobs[job_id]["progress"] = "Generating script..."
+        state.jobs[job_id]["progress"] = "Generating script..."
 
         # 1. Script
-        llm_key = req.api_key
-        if req.llm_provider == "openrouter":
-            llm_key = req.openrouter_key or os.environ.get("OPENROUTER_API_KEY", "")
+        llm_key = _resolve_llm_key(req, "llm_provider")
         script = generate_script(
             topic=req.topic,
             bpm=req.bpm,
@@ -164,15 +158,13 @@ def _run_full_generation(job_id: str, req: GenerateRequest):
             api_key=llm_key,
             model=req.llm_model,
         )
-        jobs[job_id]["progress"] = "Script generated. Synthesizing speech..."
+        state.jobs[job_id]["progress"] = "Script generated. Synthesizing speech..."
 
         # 2. TTS
         flat_text = flatten_script(script)
-        tts_key = req.api_key
-        if req.tts_provider == "openrouter":
-            tts_key = req.openrouter_key or os.environ.get("OPENROUTER_API_KEY", "")
+        tts_key = _resolve_llm_key(req, "tts_provider")
 
-        speech_path = str(DEFAULT_OUTPUT_DIR / f"{job_id}_speech.mp3")
+        speech_path = str(state.output_dir / f"{job_id}_speech.mp3")
         speech_mp3 = synthesize(
             flat_text,
             provider=req.tts_provider,
@@ -182,16 +174,16 @@ def _run_full_generation(job_id: str, req: GenerateRequest):
             model=req.tts_model,
         )
         speech_wav = convert_to_wav(speech_mp3)
-        jobs[job_id]["progress"] = "Speech synthesized. Generating beat..."
+        state.jobs[job_id]["progress"] = "Speech synthesized. Generating beat..."
 
         # 3. Beat
         estimated_speech_seconds = req.duration_minutes * 60 * 1.2
-        beat_path = str(DEFAULT_OUTPUT_DIR / f"{job_id}_beat.wav")
+        beat_path = str(state.output_dir / f"{job_id}_beat.wav")
         save_beat_to_wav(req.bpm, estimated_speech_seconds, beat_path)
-        jobs[job_id]["progress"] = "Beat generated. Mixing audio..."
+        state.jobs[job_id]["progress"] = "Beat generated. Mixing audio..."
 
         # 4. Mix
-        podcast_wav = str(DEFAULT_OUTPUT_DIR / f"{job_id}_podcast.wav")
+        podcast_wav = str(state.output_dir / f"{job_id}_podcast.wav")
         build_podcast_audio(
             speech_wav_path=speech_wav,
             beat_wav_path=beat_path,
@@ -200,7 +192,7 @@ def _run_full_generation(job_id: str, req: GenerateRequest):
         )
 
         # 5. MP3 conversion
-        podcast_mp3 = str(DEFAULT_OUTPUT_DIR / f"{job_id}_podcast.mp3")
+        podcast_mp3 = str(state.output_dir / f"{job_id}_podcast.mp3")
         try:
             final_path = convert_to_mp3(podcast_wav, podcast_mp3)
         except Exception:
@@ -220,7 +212,7 @@ def _run_full_generation(job_id: str, req: GenerateRequest):
         except Exception:
             pass
 
-        jobs[job_id].update({
+        state.jobs[job_id].update({
             "status": "completed",
             "progress": "Complete.",
             "completed_at": datetime.now(timezone.utc).isoformat(),
@@ -236,7 +228,7 @@ def _run_full_generation(job_id: str, req: GenerateRequest):
             },
         })
     except Exception as e:
-        jobs[job_id].update({
+        state.jobs[job_id].update({
             "status": "failed",
             "progress": "Failed.",
             "error": str(e),
@@ -245,7 +237,7 @@ def _run_full_generation(job_id: str, req: GenerateRequest):
 
 
 # ---------------------------------------------------------------------------
-# API Endpoints
+# Health & Config
 # ---------------------------------------------------------------------------
 
 
@@ -255,7 +247,7 @@ async def health():
     return HealthResponse(
         status="ok",
         version="2.0.0",
-        uptime=time.time() - _start_time,
+        uptime=time.time() - state.start_time,
     )
 
 
@@ -285,13 +277,18 @@ async def get_config():
     }
 
 
+# ---------------------------------------------------------------------------
+# Async generation endpoints
+# ---------------------------------------------------------------------------
+
+
 @app.post("/api/services/generate", status_code=202)
 async def generate_podcast(req: GenerateRequest):
     """Start full podcast generation asynchronously. Returns job_id for polling."""
     job_id = str(uuid.uuid4())
     created_at = datetime.now(timezone.utc).isoformat()
 
-    jobs[job_id] = {
+    state.jobs[job_id] = {
         "status": "pending",
         "progress": "Queued...",
         "error": None,
@@ -317,7 +314,7 @@ async def generate_podcast(req: GenerateRequest):
 @app.get("/api/services/jobs/{job_id}")
 async def get_job_status(job_id: str):
     """Poll job status. Returns status, progress, error, and result if completed."""
-    job = jobs.get(job_id)
+    job = state.jobs.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail=f"Job {job_id} not found.")
 
@@ -339,7 +336,7 @@ async def get_job_status(job_id: str):
 @app.get("/api/services/jobs/{job_id}/result")
 async def download_result(job_id: str):
     """Download the final podcast audio file."""
-    job = jobs.get(job_id)
+    job = state.jobs.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail=f"Job {job_id} not found.")
     if job["status"] != "completed":
@@ -362,7 +359,7 @@ async def download_result(job_id: str):
 @app.get("/api/services/jobs/{job_id}/script")
 async def download_script(job_id: str):
     """Download the script JSON for a completed job."""
-    job = jobs.get(job_id)
+    job = state.jobs.get(job_id)
     if not job:
         raise HTTPException(status_code=404, detail=f"Job {job_id} not found.")
     if job["status"] != "completed":
@@ -379,13 +376,10 @@ async def download_script(job_id: str):
 
 
 @app.post("/api/services/generate-script")
-async def generate_script_endpoint(req: ScriptRequest):
+async def generate_script_endpoint(req: ScriptRequestModel):
     """Generate a podcast script only. Returns the script JSON synchronously."""
     try:
-        llm_key = req.api_key
-        if req.provider == "openrouter":
-            llm_key = req.openrouter_key or os.environ.get("OPENROUTER_API_KEY", "")
-
+        llm_key = _resolve_llm_key(req, "provider")
         script = generate_script(
             topic=req.topic,
             bpm=req.bpm,
@@ -404,12 +398,10 @@ async def generate_audio_endpoint(req: AudioRequest):
     """Generate audio from text: TTS + beat + mix. Returns paths synchronously."""
     try:
         job_id = str(uuid.uuid4())
-        tts_key = req.api_key
-        if req.tts_provider == "openrouter":
-            tts_key = req.openrouter_key or os.environ.get("OPENROUTER_API_KEY", "")
+        tts_key = _resolve_llm_key(req, "tts_provider")
 
         # TTS
-        speech_path = str(DEFAULT_OUTPUT_DIR / f"{job_id}_speech.mp3")
+        speech_path = str(state.output_dir / f"{job_id}_speech.mp3")
         speech_mp3 = synthesize(
             req.speech_text,
             provider=req.tts_provider,
@@ -422,11 +414,11 @@ async def generate_audio_endpoint(req: AudioRequest):
 
         # Beat
         estimated_speech_seconds = req.duration_minutes * 60 * 1.2
-        beat_path = str(DEFAULT_OUTPUT_DIR / f"{job_id}_beat.wav")
+        beat_path = str(state.output_dir / f"{job_id}_beat.wav")
         save_beat_to_wav(req.bpm, estimated_speech_seconds, beat_path)
 
         # Mix
-        podcast_wav = str(DEFAULT_OUTPUT_DIR / f"{job_id}_podcast.wav")
+        podcast_wav = str(state.output_dir / f"{job_id}_podcast.wav")
         build_podcast_audio(
             speech_wav_path=speech_wav,
             beat_wav_path=beat_path,
@@ -435,7 +427,7 @@ async def generate_audio_endpoint(req: AudioRequest):
         )
 
         # MP3
-        podcast_mp3 = str(DEFAULT_OUTPUT_DIR / f"{job_id}_podcast.mp3")
+        podcast_mp3 = str(state.output_dir / f"{job_id}_podcast.mp3")
         try:
             final_path = convert_to_mp3(podcast_wav, podcast_mp3)
         except Exception:
@@ -457,7 +449,7 @@ async def generate_beat_endpoint(req: BeatRequest):
     """Generate a beat only. Returns the WAV file synchronously."""
     try:
         job_id = str(uuid.uuid4())
-        beat_path = str(DEFAULT_OUTPUT_DIR / f"{job_id}_beat.wav")
+        beat_path = str(state.output_dir / f"{job_id}_beat.wav")
         save_beat_to_wav(req.bpm, req.duration_seconds, beat_path)
         return FileResponse(
             beat_path,
@@ -476,12 +468,9 @@ async def generate_speech_endpoint(req: SpeechRequest):
     """
     try:
         job_id = str(uuid.uuid4())
-        tts_key = req.api_key
-        if req.tts_provider == "openrouter":
-            tts_key = req.openrouter_key or os.environ.get("OPENROUTER_API_KEY", "")
+        tts_key = _resolve_llm_key(req, "tts_provider")
 
-        # TTS synthesis
-        speech_path = str(DEFAULT_OUTPUT_DIR / f"{job_id}_speech.mp3")
+        speech_path = str(state.output_dir / f"{job_id}_speech.mp3")
         speech_mp3 = synthesize(
             req.speech_text,
             provider=req.tts_provider,
@@ -522,9 +511,8 @@ async def overlay_audio_endpoint(
     try:
         job_id = str(uuid.uuid4())
 
-        # Save uploaded files to disk
-        speech_path = str(DEFAULT_OUTPUT_DIR / f"{job_id}_upload_speech.wav")
-        beat_path = str(DEFAULT_OUTPUT_DIR / f"{job_id}_upload_beat.wav")
+        speech_path = str(state.output_dir / f"{job_id}_upload_speech.wav")
+        beat_path = str(state.output_dir / f"{job_id}_upload_beat.wav")
 
         speech_content = await speech_wav.read()
         beat_content = await beat_wav.read()
@@ -534,8 +522,7 @@ async def overlay_audio_endpoint(
         with open(beat_path, "wb") as f:
             f.write(beat_content)
 
-        # Overlay using build_podcast_audio (intro + ducked mix + outro)
-        podcast_wav = str(DEFAULT_OUTPUT_DIR / f"{job_id}_podcast.wav")
+        podcast_wav = str(state.output_dir / f"{job_id}_podcast.wav")
         build_podcast_audio(
             speech_wav_path=speech_path,
             beat_wav_path=beat_path,
@@ -545,8 +532,7 @@ async def overlay_audio_endpoint(
             outro_seconds=outro_seconds,
         )
 
-        # MP3 conversion
-        podcast_mp3 = str(DEFAULT_OUTPUT_DIR / f"{job_id}_podcast.mp3")
+        podcast_mp3 = str(state.output_dir / f"{job_id}_podcast.mp3")
         try:
             final_path = convert_to_mp3(podcast_wav, podcast_mp3)
         except Exception:
@@ -573,16 +559,155 @@ async def overlay_audio_endpoint(
 
 
 # ---------------------------------------------------------------------------
-# Cleanup old jobs (simple TTL-based eviction)
+# Script endpoints
 # ---------------------------------------------------------------------------
 
 
-@app.on_event("startup")
-async def startup():
-    global _start_time
-    _start_time = time.time()
-    # Ensure output directory exists
-    DEFAULT_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+@app.post("/api/services/scripts", status_code=201)
+async def create_script(req: ScriptStoreRequest):
+    """Generate a podcast script, store it, and return a script_id."""
+    try:
+        llm_key = _resolve_llm_key(req, "provider")
+        script = generate_script(
+            topic=req.topic,
+            bpm=req.bpm,
+            duration_minutes=req.duration_minutes,
+            provider=req.provider,
+            api_key=llm_key,
+            model=req.model,
+        )
+
+        script_id = str(uuid.uuid4())
+        now = datetime.now(timezone.utc).isoformat()
+        state.scripts[script_id] = {
+            "script_id": script_id,
+            "topic": req.topic,
+            "bpm": req.bpm,
+            "duration_minutes": req.duration_minutes,
+            "script": script,
+            "created_at": now,
+            "follow_up_questions": None,
+            "summary": None,
+        }
+
+        return {
+            "status": "ok",
+            "script_id": script_id,
+            "script": script,
+            "created_at": now,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/services/scripts")
+async def list_scripts():
+    """List all stored scripts with metadata (no full script content)."""
+    return {
+        "scripts": [
+            {
+                "script_id": s["script_id"],
+                "topic": s["topic"],
+                "bpm": s["bpm"],
+                "duration_minutes": s["duration_minutes"],
+                "title": s["script"].get("title", "Untitled"),
+                "created_at": s["created_at"],
+                "has_follow_up": s["follow_up_questions"] is not None,
+                "has_summary": s["summary"] is not None,
+            }
+            for s in state.scripts.values()
+        ],
+        "count": len(state.scripts),
+    }
+
+
+@app.get("/api/services/scripts/{script_id}")
+async def get_script(script_id: str):
+    """Retrieve a stored script by its script_id. Returns full script content."""
+    entry = state.scripts.get(script_id)
+    if not entry:
+        raise HTTPException(status_code=404, detail=f"Script {script_id} not found.")
+    return entry
+
+
+@app.post("/api/services/scripts/{script_id}/follow-up")
+async def generate_follow_up(script_id: str, req: FollowUpRequest):
+    """Generate follow-up questions for a stored script."""
+    entry = state.scripts.get(script_id)
+    if not entry:
+        raise HTTPException(status_code=404, detail=f"Script {script_id} not found.")
+
+    try:
+        llm_key = _resolve_llm_key(req, "provider")
+        questions = generate_follow_up_questions(
+            topic=req.topic,
+            script=entry["script"],
+            provider=req.provider,
+            api_key=llm_key,
+            model=req.model,
+        )
+        entry["follow_up_questions"] = questions
+
+        return {
+            "status": "ok",
+            "script_id": script_id,
+            "follow_up_questions": questions,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/services/scripts/{script_id}/summary")
+async def generate_summary(script_id: str, req: SummaryRequest):
+    """Generate a summary for a stored script."""
+    entry = state.scripts.get(script_id)
+    if not entry:
+        raise HTTPException(status_code=404, detail=f"Script {script_id} not found.")
+
+    try:
+        llm_key = _resolve_llm_key(req, "provider")
+        summary = generate_script_summary(
+            script=entry["script"],
+            provider=req.provider,
+            api_key=llm_key,
+            model=req.model,
+        )
+        entry["summary"] = summary
+
+        return {
+            "status": "ok",
+            "script_id": script_id,
+            "summary": summary,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ---------------------------------------------------------------------------
+# Job TTL eviction (lightweight — runs on each request)
+# ---------------------------------------------------------------------------
+
+
+def _evict_stale_jobs():
+    """Remove jobs older than TTL threshold."""
+    ttl = timedelta(hours=cfg.JOB_TTL_HOURS)
+    now = datetime.now(timezone.utc)
+    stale_ids = [
+        jid for jid, job in state.jobs.items()
+        if job.get("completed_at") and (
+            now - datetime.fromisoformat(job["completed_at"])
+        ) > ttl
+    ]
+    for jid in stale_ids:
+        state.jobs.pop(jid, None)
+
+
+# Schedule eviction before each request via middleware
+@app.middleware("http")
+async def _evict_middleware(request, call_next):
+    _evict_stale_jobs()
+    response = await call_next(request)
+    return response
 
 
 # ---------------------------------------------------------------------------
@@ -592,5 +717,5 @@ async def startup():
 if __name__ == "__main__":
     import uvicorn
     print(f"📡 Podcast Worker Service starting on http://0.0.0.0:8100")
-    print(f"   Output directory: {DEFAULT_OUTPUT_DIR}")
-    uvicorn.run(app, host="0.0.0.0", port=8100, log_level="info")
+    print(f"   Output directory: {state.output_dir}")
+    uvicorn.run("podcast_worker.main:app", host="0.0.0.0", port=8100, log_level="info")
