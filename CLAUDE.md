@@ -3,6 +3,8 @@
 ## Overview
 The backend Python worker service for the StraubAH podcast generator. Provides a FastAPI HTTP API that iOS calls for heavy compute: LLM script generation, TTS synthesis, procedural beat generation, and audio mixing.
 
+> **API Contract**: See [`API_SPEC.md`](../API_SPEC.md) in the root of the monorepo for the full request/response specification shared with the iOS client.
+
 ## Architecture
 
 ### Package Structure
