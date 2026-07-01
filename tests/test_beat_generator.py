@@ -6,15 +6,11 @@ within amplitude limits, and with the expected structure.
 """
 
 import os
-import sys
 import tempfile
 import wave
 
 import numpy as np
 import pytest
-
-# Add src to path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from podcast_worker.core.beat_generator import generate_beat, save_beat_to_wav, _bpm_to_beat_interval, _get_energy_profile
 

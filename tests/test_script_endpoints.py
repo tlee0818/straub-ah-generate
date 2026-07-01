@@ -2,17 +2,12 @@
 Tests for script API endpoints — script storage, retrieval, follow-up, summary.
 """
 
-import os
-import sys
 import uuid
 
 import pytest
 from fastapi.testclient import TestClient
 
-# Add src to path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
-
-# Import and monkey-patch the scripts dict before importing the app
+# Import and monkey-patch the scripts store before importing the app
 from podcast_worker import main as app_module
 
 # Clear and populate the scripts store with a known script for testing

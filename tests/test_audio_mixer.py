@@ -6,15 +6,11 @@ and overall output quality.
 """
 
 import os
-import sys
 import tempfile
 import wave
 
 import numpy as np
 import pytest
-
-# Add src to path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from podcast_worker.core.audio_mixer import (
     detect_speech_regions,

@@ -6,13 +6,8 @@ calling real LLM APIs.
 """
 
 import json
-import os
-import sys
 
 import pytest
-
-# Add src to path
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from podcast_worker.core.script_generator import (
     _get_follow_up_prompt,
