@@ -69,6 +69,21 @@ class TestGetScript:
         assert resp.status_code == 404
 
 
+class TestGetScriptOutline:
+    def test_get_known_script_outline(self):
+        resp = client.get(f"/api/services/scripts/{_known_id}/outline")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["script_id"] == _known_id
+        assert data["outline"]["title"] == "Test Episode"
+        assert data["outline"]["sections"][0]["segment_type"] == "intro"
+        assert data["outline"]["sections"][1]["topic"] == "Section 2"
+
+    def test_get_unknown_script_outline(self):
+        resp = client.get("/api/services/scripts/nonexistent-id/outline")
+        assert resp.status_code == 404
+
+
 class TestCreateScript:
     def test_create_script_validates_required_fields(self):
         resp = client.post("/api/services/scripts", json={"topic": "", "bpm": 120})

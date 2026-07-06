@@ -140,6 +140,88 @@ class TestProjectsCRUD:
         assert p["project_id"].startswith("prj_")
         assert data["manifest_url"] == f"/api/v1/projects/{p['project_id']}"
 
+    def test_outline_preview_returns_reviewable_plan(self, client, auth_headers, monkeypatch):
+        from podcast_worker.routers import v1_projects
+
+        def fake_generate_script_outline(topic, bpm, duration_minutes, provider=None, model=None):
+            return {
+                "title": f"{topic.title()} Outline",
+                "sections": [
+                    {
+                        "segment_type": "intro",
+                        "topic": "Set the hook",
+                        "approx_duration_seconds": 30,
+                    },
+                    {
+                        "segment_type": "content",
+                        "topic": "Develop the idea",
+                        "approx_duration_seconds": 60,
+                    },
+                ],
+            }
+
+        monkeypatch.setattr(v1_projects, "generate_script_outline", fake_generate_script_outline)
+
+        resp = client.post(
+            "/api/v1/projects/outline-preview",
+            json={"topic": "creative focus", "bpm": 120, "duration_minutes": 3},
+            headers=auth_headers,
+        )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["project_id"] == "preview"
+        assert data["topic"] == "creative focus"
+        assert data["title"] == "Creative Focus Outline"
+        assert [section["topic"] for section in data["sections"]] == [
+            "Set the hook",
+            "Develop the idea",
+        ]
+        assert "text" not in data["sections"][0]
+
+    def test_preview_outline_returns_reviewable_plan(self, client, auth_headers, monkeypatch):
+        from podcast_worker.routers import v1_projects
+
+        def fake_generate_script_outline(topic, bpm, duration_minutes=5, provider=None, **kwargs):
+            return {
+                "title": f"{topic} plan",
+                "sections": [
+                    {
+                        "segment_type": "intro",
+                        "topic": "Set up the question",
+                        "approx_duration_seconds": 30,
+                    },
+                    {
+                        "segment_type": "content",
+                        "topic": "Explore the answer",
+                        "approx_duration_seconds": 45,
+                    },
+                ],
+            }
+
+        monkeypatch.setattr(v1_projects, "generate_script_outline", fake_generate_script_outline)
+
+        resp = client.post(
+            "/api/v1/projects/outline-preview",
+            json={"topic": "stoicism", "bpm": 120, "duration_minutes": 5},
+            headers=auth_headers,
+        )
+
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["project_id"] == "preview"
+        assert data["topic"] == "stoicism"
+        assert data["title"] == "stoicism plan"
+        assert data["sections"][0]["segment_type"] == "intro"
+        assert data["sections"][0]["topic"] == "Set up the question"
+
+    def test_preview_outline_requires_auth(self, client):
+        resp = client.post(
+            "/api/v1/projects/outline-preview",
+            json={"topic": "stoicism", "bpm": 120},
+        )
+        assert resp.status_code == 401
+
     def test_create_project_validation(self, client, auth_headers):
         # Missing required field
         resp = client.post(
@@ -211,6 +293,62 @@ class TestProjectsCRUD:
         data = resp.json()
         assert data["project_id"] == pid
         assert data["topic"] == "get-test"
+
+    def test_get_project_outline_returns_section_plan(self, client, auth_headers):
+        import asyncio
+
+        from podcast_worker.core import persistence
+        from podcast_worker.core.config import settings as cfg
+
+        create_resp = client.post(
+            "/api/v1/projects",
+            json={"topic": "outline-test", "bpm": 110},
+            headers=auth_headers,
+        )
+        pid = create_resp.json()["project"]["project_id"]
+
+        asyncio.run(
+            persistence.upsert_segment(
+                cfg.db_path,
+                {
+                    "segment_id": "seg_outline_1",
+                    "project_id": pid,
+                    "index": 0,
+                    "subtopic": "Opening question",
+                    "title": "A Useful Outline",
+                    "status": "queued",
+                    "text": "Full script text should not appear in the outline response.",
+                    "duration_seconds": 30,
+                    "primary_audio_artifact_id": None,
+                    "error": None,
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "updated_at": "2026-01-01T00:00:00Z",
+                },
+            )
+        )
+
+        resp = client.get(f"/api/v1/projects/{pid}/outline", headers=auth_headers)
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["project_id"] == pid
+        assert data["topic"] == "outline-test"
+        assert data["title"] == "A Useful Outline"
+        assert data["sections"] == [
+            {
+                "index": 0,
+                "segment_id": "seg_outline_1",
+                "segment_type": "content",
+                "topic": "Opening question",
+                "title": "A Useful Outline",
+                "approx_duration_seconds": 30.0,
+            }
+        ]
+        assert "Full script text" not in str(data)
+
+    def test_get_project_outline_not_found(self, client, auth_headers):
+        resp = client.get("/api/v1/projects/prj_nonexistent/outline", headers=auth_headers)
+        assert resp.status_code == 404
+        assert resp.json()["error"]["code"] == "not_found"
 
     def test_delete_project(self, client, auth_headers):
         create_resp = client.post(

@@ -15,11 +15,30 @@ from podcast_worker.core.script_generator import (
     generate_script,
     generate_follow_up_questions,
     generate_script_summary,
+    generate_script_outline,
 )
 from podcast_worker.core.dependencies import resolve_llm_key
 from podcast_worker.main import state
 
 router = APIRouter(tags=["scripts"])
+def _outline_from_script(script: dict) -> dict:
+    if script.get("outline"):
+        return script["outline"]
+
+    return {
+        "title": script.get("title", "Untitled"),
+        "sections": [
+            {
+                "segment_type": segment.get("segment_type", "content"),
+                "topic": segment.get("subtopic") or segment.get("title") or f"Section {index + 1}",
+                "title": segment.get("title"),
+                "approx_duration_seconds": segment.get("approx_duration_seconds"),
+            }
+            for index, segment in enumerate(script.get("segments", []))
+        ],
+    }
+
+
 
 
 @router.post("/api/services/generate-script")
@@ -36,6 +55,24 @@ async def generate_script_endpoint(req: ScriptRequest):
             model=req.model,
         )
         return {"status": "ok", "script": script}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/api/services/generate-outline")
+async def generate_outline_endpoint(req: ScriptRequest):
+    """Generate only the script outline synchronously."""
+    try:
+        llm_key = resolve_llm_key(req, "provider")
+        outline = generate_script_outline(
+            topic=req.topic,
+            bpm=req.bpm,
+            duration_minutes=req.duration_minutes,
+            provider=req.provider,
+            api_key=llm_key,
+            model=req.model,
+        )
+        return {"status": "ok", "outline": outline}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -105,6 +142,19 @@ async def get_script(script_id: str):
     if not entry:
         raise HTTPException(status_code=404, detail=f"Script {script_id} not found.")
     return entry
+
+
+@router.get("/api/services/scripts/{script_id}/outline")
+async def get_script_outline(script_id: str):
+    """Retrieve the outline for a stored script without full script text."""
+    entry = state.scripts.get(script_id)
+    if not entry:
+        raise HTTPException(status_code=404, detail=f"Script {script_id} not found.")
+
+    return {
+        "script_id": script_id,
+        "outline": _outline_from_script(entry["script"]),
+    }
 
 
 @router.post("/api/services/scripts/{script_id}/follow-up")

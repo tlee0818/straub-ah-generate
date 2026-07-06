@@ -64,6 +64,24 @@ class Segment(BaseModel):
     updated_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
 
+class OutlineSection(BaseModel):
+    """One planned script section derived from project segments."""
+    index: int = Field(..., description="Playback order within the project")
+    segment_id: Optional[str] = Field(default=None, description="Segment id when the section has been created")
+    segment_type: str = Field(default="content", description="intro | content | outro")
+    topic: str = Field(..., description="Planned section topic")
+    title: Optional[str] = Field(default=None, description="User-facing section title")
+    approx_duration_seconds: Optional[float] = Field(default=None, description="Planned or generated section duration")
+
+
+class ProjectOutlineResponse(BaseModel):
+    """Response for GET /api/v1/projects/{id}/outline."""
+    project_id: str
+    topic: str
+    title: str
+    sections: list[OutlineSection] = Field(default_factory=list)
+
+
 class Artifact(BaseModel):
     """Durable media or generation output metadata."""
     artifact_id: str = Field(..., description="Stable canonical artifact identifier")
@@ -90,6 +108,14 @@ class ProjectError(BaseModel):
 # Request models
 # ═══════════════════════════════════════════════════════════════════════════
 
+class OutlinePreviewRequest(BaseModel):
+    """POST /api/v1/projects/outline-preview — generate a reviewable outline first."""
+    topic: str = Field(..., min_length=1, max_length=200, description="Podcast topic")
+    bpm: int = Field(..., ge=settings.min_bpm, le=settings.max_bpm, description="Beats per minute")
+    duration_minutes: int = Field(default=5, ge=1, le=30, description="Target duration in minutes")
+    llm_profile_id: Optional[str] = Field(default="default", description="Server-defined safe LLM profile id")
+
+
 
 class ProjectCreateRequest(BaseModel):
     """POST /api/v1/projects — user intent only; provider secrets are server-side."""
@@ -99,6 +125,7 @@ class ProjectCreateRequest(BaseModel):
     voice_id: Optional[str] = Field(default=None, description="Voice ID from /api/v1/config voices list")
     llm_profile_id: Optional[str] = Field(default="default", description="Server-defined safe LLM profile id")
     tts_profile_id: Optional[str] = Field(default="default", description="Server-defined safe TTS profile id")
+    approved_outline: Optional[ProjectOutlineResponse] = Field(default=None, description="User-reviewed outline to use for script generation")
 
 
 class TransferUrlRequest(BaseModel):

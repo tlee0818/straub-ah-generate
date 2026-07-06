@@ -324,21 +324,40 @@ Return ONLY valid JSON with this exact structure:
 # ---------------------------------------------------------------------------
 
 
-def generate_script(
+def generate_script_outline(
     topic: str,
     bpm: int,
     duration_minutes: int = 5,
     provider: Optional[str] = None,
     **kwargs,
 ) -> dict:
-    """Generate a podcast script using outline-first section generation."""
+    """Generate a podcast section outline without writing full script text."""
     outline_prompt = _get_outline_prompt(topic, bpm, duration_minutes)
-    outline = _call_provider(
+    return _call_provider(
         "You are a podcast outline planner. You output raw JSON only.",
         outline_prompt,
         provider=provider,
         **kwargs,
     )
+
+
+def generate_script(
+    topic: str,
+    bpm: int,
+    duration_minutes: int = 5,
+    provider: Optional[str] = None,
+    outline: Optional[dict] = None,
+    **kwargs,
+) -> dict:
+    """Generate a podcast script using outline-first section generation."""
+    if outline is None:
+        outline = generate_script_outline(
+            topic=topic,
+            bpm=bpm,
+            duration_minutes=duration_minutes,
+            provider=provider,
+            **kwargs,
+        )
 
     sections = outline.get("sections", [])
     generated_segments = []

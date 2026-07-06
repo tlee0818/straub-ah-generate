@@ -40,14 +40,14 @@ def _short_id(prefix: str) -> str:
 
 def run_project_pipeline(db_path: str, project_id: str, output_dir: str,
                          topic: str, bpm: int, duration_minutes: int,
-                         voice_id: str | None) -> None:
+                         voice_id: str | None, outline: dict | None = None) -> None:
     """Run the full segment generation pipeline for a project in a background thread.
 
     This function is designed to be called from a daemon thread.  It handles
     every step and persists state durably at each transition so restarts are safe.
     """
     try:
-        _run_pipeline(db_path, project_id, output_dir, topic, bpm, duration_minutes, voice_id)
+        _run_pipeline(db_path, project_id, output_dir, topic, bpm, duration_minutes, voice_id, outline)
     except Exception as exc:
         # Project-level failure — persist error and mark failed if recoverable
         _persist_project_failure(db_path, project_id, str(exc))
@@ -55,7 +55,7 @@ def run_project_pipeline(db_path: str, project_id: str, output_dir: str,
 
 def _run_pipeline(db_path: str, project_id: str, output_dir: str,
                   topic: str, bpm: int, duration_minutes: int,
-                  voice_id: str | None) -> None:
+                  voice_id: str | None, outline: dict | None = None) -> None:
     out = Path(output_dir)
 
     # 1. Transition to generating
@@ -71,6 +71,7 @@ def _run_pipeline(db_path: str, project_id: str, output_dir: str,
         duration_minutes=duration_minutes,
         provider=provider,
         model=model,
+        outline=outline,
     )
     episode_title = script.get("title", topic)
 
