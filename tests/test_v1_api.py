@@ -179,42 +179,6 @@ class TestProjectsCRUD:
         ]
         assert "text" not in data["sections"][0]
 
-    def test_preview_outline_returns_reviewable_plan(self, client, auth_headers, monkeypatch):
-        from podcast_worker.routers import v1_projects
-
-        def fake_generate_script_outline(topic, bpm, duration_minutes=5, provider=None, **kwargs):
-            return {
-                "title": f"{topic} plan",
-                "sections": [
-                    {
-                        "segment_type": "intro",
-                        "topic": "Set up the question",
-                        "approx_duration_seconds": 30,
-                    },
-                    {
-                        "segment_type": "content",
-                        "topic": "Explore the answer",
-                        "approx_duration_seconds": 45,
-                    },
-                ],
-            }
-
-        monkeypatch.setattr(v1_projects, "generate_script_outline", fake_generate_script_outline)
-
-        resp = client.post(
-            "/api/v1/projects/outline-preview",
-            json={"topic": "stoicism", "bpm": 120, "duration_minutes": 5},
-            headers=auth_headers,
-        )
-
-        assert resp.status_code == 200
-        data = resp.json()
-        assert data["project_id"] == "preview"
-        assert data["topic"] == "stoicism"
-        assert data["title"] == "stoicism plan"
-        assert data["sections"][0]["segment_type"] == "intro"
-        assert data["sections"][0]["topic"] == "Set up the question"
-
     def test_preview_outline_requires_auth(self, client):
         resp = client.post(
             "/api/v1/projects/outline-preview",

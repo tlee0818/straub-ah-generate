@@ -27,20 +27,24 @@ services/
     └── test_audio_mixer.py
 ```
 
-### API Endpoints (port 8100)
-| Endpoint | Method | Type | Description |
-|---|---|---|---|
-| `/api/services/health` | GET | Sync | Health check |
-| `/api/services/config` | GET | Sync | Available providers, voices, models, BPM range |
-| `/api/services/generate` | POST | Async | Full pipeline — returns `job_id` for polling |
-| `/api/services/jobs/{id}` | GET | Sync | Poll job status/result |
-| `/api/services/jobs/{id}/result` | GET | Sync | Download audio file |
-| `/api/services/jobs/{id}/script` | GET | Sync | Download script JSON |
-| `/api/services/generate-script` | POST | Sync | Script generation only |
-| `/api/services/generate-audio` | POST | Sync | TTS + beat + mix (full audio) |
-| `/api/services/generate-beat` | POST | Sync | Beat-only generation (returns WAV) |
-| `/api/services/generate-speech` | POST | Sync | TTS-only generation (returns WAV) |
-| `/api/services/overlay-audio` | POST | Sync | Multipart upload: speech WAV + beat WAV → mixed podcast |
+### Canonical Product API
+
+The hosted product API is `/api/v1/*`; see `../API_SPEC.md` for exact request and response schemas.
+
+| Endpoint | Method | Description |
+|---|---|---|
+| `/api/v1/health` | GET | Health check |
+| `/api/v1/config` | GET | Safe server-defined profiles, voices, and ranges |
+| `/api/v1/projects/outline-preview` | POST | Generate a reviewable outline before full project creation |
+| `/api/v1/projects` | POST | Create a durable project and start generation |
+| `/api/v1/projects` | GET | List durable project manifests |
+| `/api/v1/projects/{id}` | GET | Read the canonical project manifest |
+| `/api/v1/projects/{id}/outline` | GET | Read the lightweight outline/section plan |
+| `/api/v1/projects/{id}` | DELETE | Delete a project and retained artifacts |
+| `/api/v1/artifacts/{id}` | GET | Download an artifact |
+| `/api/v1/artifacts/{id}/transfer-url` | POST | Refresh a short-lived transfer URL |
+
+Legacy `/api/services/*` endpoints remain dev-only and must not be used as product guidance.
 
 ## Tech Stack
 - **Runtime**: Python 3.10+
@@ -51,16 +55,16 @@ services/
 - **FFmpeg**: required for MP3 conversion (`convert_to_mp3`)
 
 ## Generation Pipeline
-1. **Script** → `script_generator.py` → LLM returns JSON `{title, segments[]}`
-2. **Speech** → `tts_engine.py` → TTS output (MP3), converted to WAV
-3. **Beat** → `beat_generator.py` → numpy procedural beat at target BPM
-4. **Mix** → `audio_mixer.py` → speech + beat with ducking, intro/outro, normalize
+1. **Outline preview** → `script_generator.py` → LLM returns JSON `{title, sections[]}` for user review
+2. **Script** → `script_generator.py` → LLM writes approved outline sections one at a time with neighboring context
+3. **Speech** → `tts_engine.py` → TTS output (MP3), converted to WAV
+4. **Beat** → `beat_generator.py` → numpy procedural beat at target BPM
+5. **Mix** → `audio_mixer.py` → speech + beat with ducking, intro/outro, normalize
 
 ## Key Design Decisions
-- **Jobs stored in-memory** (simple dict). For production, swap to Redis/DB.
-- **Separated pipeline** (`generate-speech` + `generate-beat` + `overlay-audio`) allows the iOS app to run steps independently and handle overlay locally if needed.
-- **Async full pipeline** via `generate` endpoint runs in a daemon thread.
-- **All sync endpoints** (`generate-beat`, `generate-speech`, `overlay-audio`) are synchronous — fast enough for real-time use.
+- **Durable v1 state** lives in SQLite-backed `PodcastProject`, segment, artifact, provenance, and error tables.
+- **Outline-first generation** lets iOS show and refine the episode plan before full script/audio work starts.
+- **Legacy `/api/services/*` routes** are retained only for development experiments.
 
 ## Beat Engine (Python)
 - Built with numpy (vs. Accelerate/vDSP in the Swift version)
