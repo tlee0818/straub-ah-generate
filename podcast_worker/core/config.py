@@ -64,6 +64,12 @@ class Settings(BaseSettings):
     # --- Job TTL ---
     job_ttl_hours: int = 24
 
+    # --- Auth ---
+    auth_token: str = ""
+
+    # --- Persistence ---
+    db_path: str = "podcast_worker.db"
+
 
 # Singleton for fast import
 settings = Settings()

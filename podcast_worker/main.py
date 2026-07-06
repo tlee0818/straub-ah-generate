@@ -1,21 +1,17 @@
 """FastAPI application for the Podcast Worker Service.
 
-Endpoints:
-  POST /api/services/generate          — Full pipeline (async, returns job_id)
-  GET  /api/services/jobs/{job_id}     — Job status polling
-  GET  /api/services/jobs/{job_id}/result  — Download result
-  POST /api/services/generate-script   — Script generation only (sync)
-  POST /api/services/generate-audio    — Audio generation only (sync)
-  POST /api/services/generate-beat     — Beat generation only (sync)
-  GET  /api/services/health            — Health check
-  GET  /api/services/config            — Available providers, voices, models
-  POST /api/services/scripts           — Generate and store a script
-  GET  /api/services/scripts           — List stored scripts
-  GET  /api/services/scripts/{id}      — Retrieve a stored script
-  POST /api/services/scripts/{id}/follow-up — Generate follow-up questions
-  POST /api/services/scripts/{id}/summary   — Generate script summary
+Production (v1) endpoints:
+  GET    /api/v1/health                    — Health check
+  GET    /api/v1/config                    — Safe client profiles (no secrets)
+  POST   /api/v1/projects                  — Create project, start generation
+  GET    /api/v1/projects                  — List projects
+  GET    /api/v1/projects/{id}             — Full PodcastProject manifest
+  DELETE /api/v1/projects/{id}             — Delete project
+  GET    /api/v1/artifacts/{id}            — Download artifact
+  POST   /api/v1/artifacts/{id}/transfer-url — Refresh signed transfer URL
 
-The iOS app uses PodcastServiceClient to talk to this service.
+Legacy / dev-only endpoints under /api/services/* are quarantined in a
+legacy router and are NOT part of the v1 product contract.
 """
 
 import json
@@ -29,7 +25,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 
@@ -64,6 +60,7 @@ from podcast_worker.core.script_generator import (
 from podcast_worker.core.tts_engine import synthesize, convert_to_wav
 from podcast_worker.core.beat_generator import save_beat_to_wav, generate_beat
 from podcast_worker.core.audio_mixer import build_podcast_audio, convert_to_mp3
+from podcast_worker.core.models_v1 import ErrorEnvelope, ErrorResponse
 
 # ---------------------------------------------------------------------------
 # Application state
@@ -122,7 +119,17 @@ app.add_middleware(
 )
 
 # ---------------------------------------------------------------------------
-# Register routers
+# Register v1 product routers
+# ---------------------------------------------------------------------------
+
+from podcast_worker.routers import v1_health, v1_projects, v1_artifacts
+
+app.include_router(v1_health.router)
+app.include_router(v1_projects.router)
+app.include_router(v1_artifacts.router)
+
+# ---------------------------------------------------------------------------
+# Legacy / dev-only routers (NOT part of v1 product contract)
 # ---------------------------------------------------------------------------
 
 from podcast_worker.routers import health, jobs, audio, scripts
@@ -131,6 +138,52 @@ app.include_router(health.router)
 app.include_router(jobs.router)
 app.include_router(audio.router)
 app.include_router(scripts.router)
+
+# ---------------------------------------------------------------------------
+# v1 error handlers
+# ---------------------------------------------------------------------------
+
+
+@app.exception_handler(PodcastWorkerError)
+async def podcast_worker_error_handler(request: Request, exc: PodcastWorkerError):
+    return JSONResponse(
+        status_code=502,
+        content=ErrorEnvelope(
+            error=ErrorResponse(code="provider_error", message=str(exc)),
+        ).model_dump(),
+    )
+
+
+@app.exception_handler(HTTPException)
+async def v1_http_exception_handler(request: Request, exc: HTTPException):
+    """Preserve existing HTTPException behavior for non-v1 paths,
+    wrap v1 paths in the standard error envelope."""
+    path = request.url.path
+    if path.startswith("/api/v1/"):
+        # Map status code to error code
+        code_map = {
+            400: "bad_request",
+            401: "unauthorized",
+            403: "forbidden",
+            404: "not_found",
+            409: "conflict",
+            422: "validation_error",
+            500: "internal_error",
+            502: "provider_error",
+        }
+        code = code_map.get(exc.status_code, "unknown_error")
+        return JSONResponse(
+            status_code=exc.status_code,
+            content=ErrorEnvelope(
+                error=ErrorResponse(code=code, message=str(exc.detail)),
+            ).model_dump(),
+        )
+    # Fall through to default handler for legacy paths
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"detail": exc.detail},
+    )
+
 
 # ---------------------------------------------------------------------------
 # Job TTL eviction (lightweight — runs on each request)
@@ -165,5 +218,8 @@ async def _evict_middleware(request, call_next):
 if __name__ == "__main__":
     import uvicorn
     print(f"📡 Podcast Worker Service starting on http://0.0.0.0:8100")
+    print(f"   V1 API: /api/v1/*")
+    print(f"   Legacy (dev-only): /api/services/*")
     print(f"   Output directory: {state.output_dir}")
+    print(f"   Auth: {'enabled' if cfg.settings.auth_token else 'disabled (dev mode)'}")
     uvicorn.run("podcast_worker.main:app", host="0.0.0.0", port=8100, log_level="info")
