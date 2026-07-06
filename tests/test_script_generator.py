@@ -72,7 +72,9 @@ class TestScriptGenerationFlow:
             outline["sections"][0],
             outline["sections"][2],
             "Welcome text from the prior section.",
-            4,
+            {"research_brief": "Lead context"},
+            {"key_points": ["Important research point"]},
+            duration_minutes=4,
         )
 
         assert "FULL OUTLINE" in prompt
@@ -81,6 +83,8 @@ class TestScriptGenerationFlow:
         assert "PREVIOUS SECTION TOPIC: Hook" in prompt
         assert "NEXT SECTION TOPIC: Takeaway" in prompt
         assert "Welcome text from the prior section." in prompt
+        assert "RESEARCH CONTEXT" in prompt
+        assert "Important research point" in prompt
 
     def test_generate_script_calls_outline_then_each_section_with_context(self, monkeypatch):
         calls = []
@@ -93,6 +97,15 @@ class TestScriptGenerationFlow:
                 {"segment_type": "outro", "topic": "Takeaway", "approx_duration_seconds": 30},
             ],
         }
+        research_brief = {
+            "research_brief": "Lead research context",
+            "follow_up_questions": ["What angle should we go deeper on?"],
+        }
+        research_responses = [
+            {"topic": "Hook", "key_points": ["Hook research"], "intriguing_angles": ["Surprise"]},
+            {"topic": "Risk framing", "key_points": ["Risk research"], "intriguing_angles": ["Tension"]},
+            {"topic": "Takeaway", "key_points": ["Takeaway research"], "intriguing_angles": ["Resolution"]},
+        ]
         section_responses = [
             {"segment_type": "intro", "text": "Intro text.", "approx_duration_seconds": 30},
             {"segment_type": "content", "text": "Risk text.", "approx_duration_seconds": 45},
@@ -101,9 +114,13 @@ class TestScriptGenerationFlow:
 
         def fake_call_provider(system_prompt, user_prompt, provider=None, **kwargs):
             calls.append((system_prompt, user_prompt, provider, kwargs))
-            if len(calls) == 1:
+            if "outline planner" in system_prompt:
                 return outline
-            return section_responses[len(calls) - 2]
+            if "lead research agent" in system_prompt:
+                return research_brief
+            if "subtopic research agent" in system_prompt:
+                return research_responses[len([call for call in calls if "subtopic research agent" in call[0]]) - 1]
+            return section_responses[len([call for call in calls if "script writer" in call[0]]) - 1]
 
         monkeypatch.setattr(script_generator, "_call_provider", fake_call_provider)
 
@@ -141,18 +158,23 @@ class TestScriptGenerationFlow:
                 },
             ],
         }
-        assert len(calls) == 4
+        assert len(calls) == 8
         assert "outline planner" in calls[0][0]
         assert "sections" in calls[0][1]
+        assert "lead research agent" in calls[1][0]
+        assert all("subtopic research agent" in call[0] for call in calls[2:5])
+        assert all("script writer" in call[0] for call in calls[5:])
         assert all(call[2] == "test-provider" for call in calls)
-        assert all(call[3] == {"model": "test-model"} for call in calls)
+        assert calls[0][3] == {"model": "test-model"}
 
-        second_section_prompt = calls[2][1]
+        second_section_prompt = calls[6][1]
         assert "FULL OUTLINE" in second_section_prompt
         assert "PREVIOUS SECTION TOPIC: Hook" in second_section_prompt
         assert "CURRENT SECTION TOPIC: Risk framing" in second_section_prompt
         assert "NEXT SECTION TOPIC: Takeaway" in second_section_prompt
         assert "IMMEDIATELY PREVIOUS SECTION TEXT:\nIntro text." in second_section_prompt
+        assert "RESEARCH CONTEXT" in second_section_prompt
+        assert "Risk research" in second_section_prompt
 
 class TestFollowUpPrompt:
     def test_prompt_contains_script_content(self):
@@ -232,10 +254,14 @@ class TestPipelineSegmentCreation:
         calls = []
 
         def fake_call(system_prompt, user_prompt, provider=None, **kwargs):
-            calls.append(1)
-            if len(calls) == 1:
+            calls.append(system_prompt)
+            if "outline planner" in system_prompt:
                 return outline
-            return responses[len(calls) - 2]
+            if "lead research agent" in system_prompt:
+                return {"research_brief": "Brief"}
+            if "subtopic research agent" in system_prompt:
+                return {"key_points": ["Research point"]}
+            return responses[len([call for call in calls if "script writer" in call]) - 1]
 
         monkeypatch.setattr(script_generator, "_call_provider", fake_call)
 
@@ -293,20 +319,24 @@ class TestPipelineSegmentCreation:
         prompts = []
 
         def fake_call(system_prompt, user_prompt, provider=None, **kwargs):
-            prompts.append(user_prompt)
-            if len(prompts) == 1:
+            if "outline planner" in system_prompt:
                 return outline
-            return section_texts[len(prompts) - 2]
+            if "lead research agent" in system_prompt:
+                return {"research_brief": "Brief"}
+            if "subtopic research agent" in system_prompt:
+                return {"key_points": ["Research point"]}
+            prompts.append(user_prompt)
+            return section_texts[len(prompts) - 1]
 
         monkeypatch.setattr(script_generator, "_call_provider", fake_call)
 
         generate_script("context-topic", 100, duration_minutes=2)
 
-        # 1 outline call + 3 section calls = 4
-        assert len(prompts) == 4
+        # 3 section writing calls after outline and research calls
+        assert len(prompts) == 3
 
         # Section 2 (index 1): middle section
-        section_prompt_2 = prompts[2]
+        section_prompt_2 = prompts[1]
         assert "FULL OUTLINE" in section_prompt_2, "Must include full outline"
         assert "PREVIOUS SECTION TOPIC:" in section_prompt_2
         assert "CURRENT SECTION TOPIC:" in section_prompt_2
@@ -315,11 +345,11 @@ class TestPipelineSegmentCreation:
         assert "First." in section_prompt_2, "Must include previous section text"
 
         # Section 1 (index 0): first section — no previous text
-        section_prompt_1 = prompts[1]
+        section_prompt_1 = prompts[0]
         assert "None - this is the first section" in section_prompt_1
 
         # Section 3 (index 2): last section — no next section
-        section_prompt_3 = prompts[3]
+        section_prompt_3 = prompts[2]
         assert "None - this is the final section" in section_prompt_3
         assert "Second." in section_prompt_3, "Must include previous section text"
 

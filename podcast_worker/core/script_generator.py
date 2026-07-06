@@ -207,6 +207,76 @@ def _format_outline_for_prompt(outline: dict) -> str:
     return "\n".join(lines)
 
 
+def _get_research_brief_prompt(topic: str, outline: dict) -> str:
+    """Build a prompt for a coordinator research agent."""
+    return f"""You are the lead research agent for a podcast production team.
+
+EPISODE TOPIC: {topic}
+
+APPROVED OUTLINE:
+{_format_outline_for_prompt(outline)}
+
+Create a research brief that delegates one focused research lane to each outline section. Include clarifying follow-up questions the host could ask the listener if the topic needs sharper intent before script writing.
+
+Return ONLY valid JSON with this exact structure:
+{{
+    "research_brief": "Short synthesis of the most important angle for the episode",
+    "audience_assumptions": ["Assumption 1", "Assumption 2"],
+    "follow_up_questions": ["Question that would clarify what the listener wants to learn"],
+    "subtopics": [
+        {{
+            "section_index": 0,
+            "topic": "Section topic",
+            "research_questions": ["Question 1", "Question 2"],
+            "source_keywords": ["keyword 1", "keyword 2"]
+        }}
+    ]
+}}
+"""
+
+
+def _get_subtopic_research_prompt(topic: str, outline: dict, section: dict, research_brief: dict) -> str:
+    """Build a prompt for one subtopic research agent."""
+    section_topic = section.get("topic") or section.get("title") or topic
+
+    return f"""You are a subtopic research agent. Research only the assigned section and return concise, script-ready notes.
+
+EPISODE TOPIC: {topic}
+ASSIGNED SECTION TOPIC: {section_topic}
+
+FULL OUTLINE:
+{_format_outline_for_prompt(outline)}
+
+LEAD RESEARCH BRIEF:
+{json.dumps(research_brief, ensure_ascii=False)}
+
+Find the ideas, examples, definitions, tensions, and open questions that would make this section specific and useful. If the section needs more user intent, include follow_up_questions that can be shown to the user before final generation.
+
+Return ONLY valid JSON with this exact structure:
+{{
+    "topic": "{section_topic}",
+    "key_points": ["Specific point 1", "Specific point 2"],
+    "examples": ["Concrete example 1"],
+    "intriguing_angles": ["Hook, tension, or surprising framing"],
+    "follow_up_questions": ["Optional question for the user"],
+    "cautions": ["Nuance or uncertainty to avoid overstating"]
+}}
+"""
+
+
+def _format_research_for_prompt(research_brief: dict, section_research: dict) -> str:
+    """Format research context for the script-writing prompt."""
+    return "\n".join(
+        [
+            "LEAD RESEARCH BRIEF:",
+            json.dumps(research_brief, ensure_ascii=False),
+            "",
+            "SECTION RESEARCH:",
+            json.dumps(section_research, ensure_ascii=False),
+        ]
+    )
+
+
 def _get_section_prompt(
     topic: str,
     bpm: int,
@@ -215,6 +285,8 @@ def _get_section_prompt(
     previous_section: Optional[dict],
     next_section: Optional[dict],
     previous_section_text: str,
+    research_brief: Optional[dict] = None,
+    section_research: Optional[dict] = None,
     duration_minutes: int = 5,
 ) -> str:
     """Build a prompt for generating one outlined section."""
@@ -250,7 +322,10 @@ NEXT SECTION TOPIC: {next_topic}
 IMMEDIATELY PREVIOUS SECTION TEXT:
 {previous_text}
 
-Write ONLY the current section. Use the previous section text for continuity, but do not repeat it. Lead naturally toward the next topic when one exists.
+RESEARCH CONTEXT:
+{_format_research_for_prompt(research_brief or {}, section_research or {})}
+
+Write ONLY the current section. Use the previous section text for continuity, but do not repeat it. Use the research context for specificity, examples, nuance, and intriguing framing. Lead naturally toward the next topic when one exists.
 
 Return ONLY valid JSON with this exact structure:
 {{
@@ -341,6 +416,40 @@ def generate_script_outline(
     )
 
 
+def generate_research_brief(
+    topic: str,
+    outline: dict,
+    provider: Optional[str] = None,
+    **kwargs,
+) -> dict:
+    """Run the lead research-agent step for an approved outline."""
+    return _call_provider(
+        "You are the lead research agent for a podcast production team. You output raw JSON only.",
+        _get_research_brief_prompt(topic, outline),
+        provider=provider,
+        temperature=0.4,
+        **kwargs,
+    )
+
+
+def generate_subtopic_research(
+    topic: str,
+    outline: dict,
+    section: dict,
+    research_brief: dict,
+    provider: Optional[str] = None,
+    **kwargs,
+) -> dict:
+    """Run one subtopic research-agent step for an outline section."""
+    return _call_provider(
+        "You are a subtopic research agent for a podcast production team. You output raw JSON only.",
+        _get_subtopic_research_prompt(topic, outline, section, research_brief),
+        provider=provider,
+        temperature=0.4,
+        **kwargs,
+    )
+
+
 def generate_script(
     topic: str,
     bpm: int,
@@ -360,6 +469,25 @@ def generate_script(
         )
 
     sections = outline.get("sections", [])
+
+    research_brief = generate_research_brief(
+        topic=topic,
+        outline=outline,
+        provider=provider,
+        **kwargs,
+    )
+    section_research_items = [
+        generate_subtopic_research(
+            topic=topic,
+            outline=outline,
+            section=section,
+            research_brief=research_brief,
+            provider=provider,
+            **kwargs,
+        )
+        for section in sections
+    ]
+
     generated_segments = []
     previous_section_text = ""
 
@@ -374,6 +502,8 @@ def generate_script(
             previous_section,
             next_section,
             previous_section_text,
+            research_brief,
+            section_research_items[index],
             duration_minutes,
         )
         generated_section = _call_provider(

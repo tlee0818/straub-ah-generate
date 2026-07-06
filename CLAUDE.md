@@ -56,14 +56,17 @@ Legacy `/api/services/*` endpoints remain dev-only and must not be used as produ
 
 ## Generation Pipeline
 1. **Outline preview** → `script_generator.py` → LLM returns JSON `{title, sections[]}` for user review
-2. **Script** → `script_generator.py` → LLM writes approved outline sections one at a time with neighboring context
-3. **Speech** → `tts_engine.py` → TTS output (MP3), converted to WAV
-4. **Beat** → `beat_generator.py` → numpy procedural beat at target BPM
-5. **Mix** → `audio_mixer.py` → speech + beat with ducking, intro/outro, normalize
+2. **Lead research agent** → creates episode-level brief, assumptions, and possible user follow-up questions
+3. **Subtopic research agents** → gather section-specific points, examples, tensions, and cautions
+4. **Script writer agent** → writes approved outline sections one at a time with neighboring context and research packets
+5. **Speech** → `tts_engine.py` → TTS output (MP3), converted to WAV
+6. **Beat** → `beat_generator.py` → numpy procedural beat at target BPM
+7. **Mix** → `audio_mixer.py` → speech + beat with ducking, intro/outro, normalize
 
 ## Key Design Decisions
 - **Durable v1 state** lives in SQLite-backed `PodcastProject`, segment, artifact, provenance, and error tables.
 - **Outline-first generation** lets iOS show and refine the episode plan before full script/audio work starts.
+- **Multi-agent script generation** separates research coordination, subtopic research, and script writing so tone stays engaging without losing factual structure.
 - **Legacy `/api/services/*` routes** are retained only for development experiments.
 
 ## Beat Engine (Python)
