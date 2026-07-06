@@ -20,7 +20,7 @@ from typing import Optional
 
 from podcast_worker.core import config as cfg
 from podcast_worker.core import persistence
-from podcast_worker.core.script_generator import generate_script, flatten_script
+from podcast_worker.core.script_generator import generate_script
 from podcast_worker.core.tts_engine import synthesize, convert_to_wav
 from podcast_worker.core.beat_generator import save_beat_to_wav, generate_beat
 from podcast_worker.core.audio_mixer import build_podcast_audio, convert_to_mp3
@@ -72,21 +72,22 @@ def _run_pipeline(db_path: str, project_id: str, output_dir: str,
         provider=provider,
         model=model,
     )
-    flat = flatten_script(script)
+    episode_title = script.get("title", topic)
 
-    # 3. Create segments in the DB
-    total_segments = len(flat)
-    for i, seg_data in enumerate(flat):
+    # 3. Create segments in the DB from outline-first generated sections
+    segments_data = script.get("segments", [])
+    total_segments = len(segments_data)
+    for i, seg_data in enumerate(segments_data):
         seg_id = _short_id("seg")
         segment = {
             "segment_id": seg_id,
             "project_id": project_id,
             "index": i,
-            "subtopic": seg_data.get("subtopic", f"Part {i + 1}"),
-            "title": seg_data.get("title"),
+            "subtopic": seg_data.get("subtopic") or seg_data.get("topic") or f"Part {i + 1}",
+            "title": seg_data.get("title") or episode_title,
             "status": "queued",
-            "text": seg_data.get("text"),
-            "duration_seconds": None,
+            "text": seg_data.get("text", ""),
+            "duration_seconds": seg_data.get("approx_duration_seconds"),
             "primary_audio_artifact_id": None,
             "error": None,
             "created_at": _now_iso(),

@@ -129,8 +129,8 @@ def _call_provider(
 # ---------------------------------------------------------------------------
 
 
-def _get_script_prompt(topic: str, bpm: int, duration_minutes: int = 5) -> str:
-    """Build the prompt for the LLM."""
+def _get_script_style_context(bpm: int, duration_minutes: int = 5) -> str:
+    """Build shared style guidance for script prompts."""
     if bpm >= 160:
         energy = "HIGH ENERGY"
         pace = "fast-paced, punchy, exciting — like a workout hype session"
@@ -148,10 +148,7 @@ def _get_script_prompt(topic: str, bpm: int, duration_minutes: int = 5) -> str:
         pace = "calm, deliberate, thoughtful"
         sentence_length = "medium to longer sentences, reflective pauses"
 
-    return f"""You are a podcast host creating a {duration_minutes}-minute solo educational podcast.
-
-TOPIC: {topic}
-ENERGY LEVEL: {energy}
+    return f"""ENERGY LEVEL: {energy}
 BPM: {bpm}
 
 The podcast will be played over a beat at {bpm} BPM, so the {pace}.
@@ -161,30 +158,106 @@ Important rules:
 - Use natural conversational language — like a knowledgeable friend explaining something
 - Avoid markdown, lists, or special formatting
 - Include brief pauses marked with [pause]
-- Structure with: hook/intro (30s), main content (~3.5 min), outro (~30s)
 - The entire script should take about {duration_minutes} minutes to read at natural pace
 - Do NOT use sound effect notations like [music], [applause] — only [pause] is allowed
-- NO special characters or emojis
+- NO special characters or emojis"""
+
+
+def _get_outline_prompt(topic: str, bpm: int, duration_minutes: int = 5) -> str:
+    """Build the outline prompt for the first LLM step."""
+    style_context = _get_script_style_context(bpm, duration_minutes)
+
+    return f"""You are planning a {duration_minutes}-minute solo educational podcast.
+
+TOPIC: {topic}
+{style_context}
+
+Create a section outline before any script text is written. The outline should include a hook/intro, several content sections, and an outro. Each section topic should be specific enough that it can be written independently while still fitting the full episode.
 
 Return ONLY valid JSON with this exact structure:
 {{
     "title": "Episode title",
-    "segments": [
+    "sections": [
         {{
             "segment_type": "intro",
-            "text": "...",
+            "topic": "Section topic",
             "approx_duration_seconds": 30
         }},
         {{
             "segment_type": "content",
-            "text": "...",
+            "topic": "Section topic",
             "approx_duration_seconds": 45
         }}
     ]
 }}
 
 The total of approx_duration_seconds should be about {duration_minutes * 60}.
-Each content segment should be 30-60 seconds of natural speech.
+Each content section should be 30-60 seconds of natural speech.
+"""
+
+
+def _format_outline_for_prompt(outline: dict) -> str:
+    """Format the full outline for section-generation prompts."""
+    lines = [f"TITLE: {outline.get('title', 'Untitled')}"]
+    for index, section in enumerate(outline.get("sections", []), start=1):
+        segment_type = section.get("segment_type", "content")
+        topic = section.get("topic") or section.get("title") or f"Section {index}"
+        duration = section.get("approx_duration_seconds", 45)
+        lines.append(f"{index}. {segment_type} ({duration}s): {topic}")
+    return "\n".join(lines)
+
+
+def _get_section_prompt(
+    topic: str,
+    bpm: int,
+    outline: dict,
+    section: dict,
+    previous_section: Optional[dict],
+    next_section: Optional[dict],
+    previous_section_text: str,
+    duration_minutes: int = 5,
+) -> str:
+    """Build a prompt for generating one outlined section."""
+    style_context = _get_script_style_context(bpm, duration_minutes)
+    current_topic = section.get("topic") or section.get("title") or topic
+    previous_topic = (
+        (previous_section or {}).get("topic")
+        or (previous_section or {}).get("title")
+        or "None - this is the first section"
+    )
+    next_topic = (
+        (next_section or {}).get("topic")
+        or (next_section or {}).get("title")
+        or "None - this is the final section"
+    )
+    previous_text = previous_section_text or "None - this is the first section"
+    segment_type = section.get("segment_type", "content")
+    duration = section.get("approx_duration_seconds", 45)
+
+    return f"""You are writing one section of a {duration_minutes}-minute solo educational podcast.
+
+EPISODE TOPIC: {topic}
+{style_context}
+
+FULL OUTLINE:
+{_format_outline_for_prompt(outline)}
+
+CURRENT SECTION TOPIC: {current_topic}
+CURRENT SEGMENT TYPE: {segment_type}
+CURRENT TARGET DURATION SECONDS: {duration}
+PREVIOUS SECTION TOPIC: {previous_topic}
+NEXT SECTION TOPIC: {next_topic}
+IMMEDIATELY PREVIOUS SECTION TEXT:
+{previous_text}
+
+Write ONLY the current section. Use the previous section text for continuity, but do not repeat it. Lead naturally toward the next topic when one exists.
+
+Return ONLY valid JSON with this exact structure:
+{{
+    "segment_type": "{segment_type}",
+    "text": "The current section script text...",
+    "approx_duration_seconds": {duration}
+}}
 """
 
 
@@ -258,14 +331,60 @@ def generate_script(
     provider: Optional[str] = None,
     **kwargs,
 ) -> dict:
-    """Generate a podcast script using the configured LLM provider."""
-    prompt = _get_script_prompt(topic, bpm, duration_minutes)
-    return _call_provider(
-        "You are a podcast script writer. You output raw JSON only.",
-        prompt,
+    """Generate a podcast script using outline-first section generation."""
+    outline_prompt = _get_outline_prompt(topic, bpm, duration_minutes)
+    outline = _call_provider(
+        "You are a podcast outline planner. You output raw JSON only.",
+        outline_prompt,
         provider=provider,
         **kwargs,
     )
+
+    sections = outline.get("sections", [])
+    generated_segments = []
+    previous_section_text = ""
+
+    for index, section in enumerate(sections):
+        previous_section = sections[index - 1] if index > 0 else None
+        next_section = sections[index + 1] if index + 1 < len(sections) else None
+        section_prompt = _get_section_prompt(
+            topic,
+            bpm,
+            outline,
+            section,
+            previous_section,
+            next_section,
+            previous_section_text,
+            duration_minutes,
+        )
+        generated_section = _call_provider(
+            "You are a podcast script writer. You output raw JSON only.",
+            section_prompt,
+            provider=provider,
+            **kwargs,
+        )
+        segment = generated_section.get("segment", generated_section)
+        generated_segments.append(
+            {
+                "segment_type": segment.get(
+                    "segment_type",
+                    section.get("segment_type", "content"),
+                ),
+                "subtopic": section.get("topic") or section.get("title") or topic,
+                "title": section.get("title") or section.get("topic"),
+                "text": segment.get("text", ""),
+                "approx_duration_seconds": segment.get(
+                    "approx_duration_seconds",
+                    section.get("approx_duration_seconds", 45),
+                ),
+            }
+        )
+        previous_section_text = generated_segments[-1]["text"]
+
+    return {
+        "title": outline.get("title", "Untitled"),
+        "segments": generated_segments,
+    }
 
 
 def flatten_script(script: dict) -> str:
