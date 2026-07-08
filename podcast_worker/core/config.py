@@ -53,6 +53,9 @@ class Settings(BaseSettings):
     # --- Audio Output ---
     output_dir: str = "output"
     sample_rate: int = 44100
+    max_text_chars: int = 20_000
+    max_upload_bytes: int = 25 * 1024 * 1024
+    max_concurrent_generations: int = 2
 
     # --- Beat Generation ---
     min_bpm: int = 60
@@ -66,6 +69,7 @@ class Settings(BaseSettings):
 
     # --- Auth ---
     auth_token: str = ""
+    allow_insecure_dev_auth: bool = False
 
     # --- Persistence ---
     db_path: str = "podcast_worker.db"
@@ -95,3 +99,6 @@ MIN_BPM = settings.min_bpm
 MAX_BPM = settings.max_bpm
 CORS_ORIGINS = settings.cors_origins
 JOB_TTL_HOURS = settings.job_ttl_hours
+MAX_TEXT_CHARS = settings.max_text_chars
+MAX_UPLOAD_BYTES = settings.max_upload_bytes
+MAX_CONCURRENT_GENERATIONS = settings.max_concurrent_generations

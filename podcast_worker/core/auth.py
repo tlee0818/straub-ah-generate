@@ -8,6 +8,7 @@ real user identity.
 
 from __future__ import annotations
 
+import secrets
 from typing import Optional
 
 from fastapi import Header, HTTPException, Request
@@ -21,14 +22,15 @@ async def require_auth(
 ) -> str:
     """Validate the Bearer token and return the owner_id (always 'single-user' in v1)."""
     if not settings.auth_token:
-        # No token configured — auth is effectively disabled for dev.
-        return "single-user"
+        if settings.allow_insecure_dev_auth:
+            return "single-user"
+        raise HTTPException(status_code=503, detail="Authentication token is not configured.")
 
     if not authorization or not authorization.startswith("Bearer "):
         raise _unauthorized("Authentication is required.")
 
     token = authorization[7:].strip()
-    if token != settings.auth_token:
+    if not secrets.compare_digest(token, settings.auth_token):
         raise _unauthorized("Invalid authentication token.")
 
     return "single-user"
@@ -40,13 +42,13 @@ async def optional_auth(request: Request) -> str | None:
     if not auth_header:
         if settings.auth_token:
             return None  # auth required but not provided
-        return "single-user"
+        return "single-user" if settings.allow_insecure_dev_auth else None
 
     if not auth_header.startswith("Bearer "):
         return None
 
     token = auth_header[7:].strip()
-    if settings.auth_token and token != settings.auth_token:
+    if settings.auth_token and not secrets.compare_digest(token, settings.auth_token):
         return None
 
     return "single-user"

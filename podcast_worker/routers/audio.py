@@ -11,9 +11,21 @@ from podcast_worker.core.tts_engine import synthesize, convert_to_wav
 from podcast_worker.core.beat_generator import save_beat_to_wav
 from podcast_worker.core.audio_mixer import build_podcast_audio, convert_to_mp3
 from podcast_worker.core.dependencies import resolve_llm_key
+from podcast_worker.core.config import settings
 from podcast_worker.main import state
 
 router = APIRouter(tags=["audio"])
+
+
+async def _read_limited_upload(upload: UploadFile) -> bytes:
+    chunks: list[bytes] = []
+    total = 0
+    while chunk := await upload.read(1024 * 1024):
+        total += len(chunk)
+        if total > settings.max_upload_bytes:
+            raise HTTPException(status_code=413, detail="Uploaded audio file is too large.")
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 @router.post("/api/services/generate-audio")
@@ -55,12 +67,10 @@ async def generate_audio_endpoint(req: AudioRequest):
         return {
             "status": "ok",
             "job_id": job_id,
-            "audio_path": final_path,
-            "speech_wav": speech_wav,
-            "beat_wav": beat_path,
+            "audio_file": os.path.basename(final_path),
         }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        raise HTTPException(status_code=500, detail="Audio generation failed.")
 
 
 @router.post("/api/services/generate-beat")
@@ -75,8 +85,8 @@ async def generate_beat_endpoint(req: BeatRequest):
             media_type="audio/wav",
             filename=f"beat_{req.bpm}bpm.wav",
         )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        raise HTTPException(status_code=500, detail="Beat generation failed.")
 
 
 @router.post("/api/services/generate-speech")
@@ -103,18 +113,18 @@ async def generate_speech_endpoint(req: SpeechRequest):
             filename=f"speech_{job_id}.wav",
             headers={"X-Job-Id": job_id},
         )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        raise HTTPException(status_code=500, detail="Speech generation failed.")
 
 
 @router.post("/api/services/overlay-audio")
 async def overlay_audio_endpoint(
     speech_wav: UploadFile = File(...),
     beat_wav: UploadFile = File(...),
-    bpm: int = Form(...),
-    duration_minutes: int = Form(default=5),
-    intro_seconds: float = Form(default=4.0),
-    outro_seconds: float = Form(default=6.0),
+    bpm: int = Form(..., ge=settings.min_bpm, le=settings.max_bpm),
+    duration_minutes: int = Form(default=5, ge=1, le=30),
+    intro_seconds: float = Form(default=4.0, ge=0, le=30),
+    outro_seconds: float = Form(default=6.0, ge=0, le=30),
 ):
     """Overlay pre-generated speech and beat WAVs into a finished podcast.
 
@@ -127,8 +137,8 @@ async def overlay_audio_endpoint(
         speech_path = str(state.output_dir / f"{job_id}_upload_speech.wav")
         beat_path = str(state.output_dir / f"{job_id}_upload_beat.wav")
 
-        speech_content = await speech_wav.read()
-        beat_content = await beat_wav.read()
+        speech_content = await _read_limited_upload(speech_wav)
+        beat_content = await _read_limited_upload(beat_wav)
 
         with open(speech_path, "wb") as f:
             f.write(speech_content)
@@ -166,5 +176,5 @@ async def overlay_audio_endpoint(
                 "X-Bpm": str(bpm),
             },
         )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        raise HTTPException(status_code=500, detail="Audio overlay failed.")

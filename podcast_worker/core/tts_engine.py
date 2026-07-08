@@ -11,6 +11,12 @@ from typing import Optional
 from . import config
 
 
+def _temporary_path(suffix: str) -> str:
+    fd, path = tempfile.mkstemp(suffix=suffix)
+    os.close(fd)
+    return path
+
+
 def _split_into_chunks(text: str, max_chars: int = 3000) -> list:
     """Split long text into chunks for TTS APIs that have limits."""
     chunks = []
@@ -41,7 +47,7 @@ def synthesize_edge(text: str, voice: Optional[str] = None, output_path: Optiona
         raise ImportError("edge-tts not installed. Run: pip install edge-tts")
 
     voice_name = voice or config.EDGE_TTS_VOICE
-    output_path = output_path or tempfile.mktemp(suffix=".mp3")
+    output_path = output_path or _temporary_path(".mp3")
 
     # edge-tts uses async, so we run it synchronously
     async def _run():
@@ -71,7 +77,7 @@ def synthesize_openai(
 
     voice_name = voice or config.OPENAI_TTS_VOICE
     model_name = model or config.OPENAI_TTS_MODEL
-    output_path = output_path or tempfile.mktemp(suffix=".mp3")
+    output_path = output_path or _temporary_path(".mp3")
 
     client = OpenAI(api_key=key)
 
@@ -88,15 +94,23 @@ def synthesize_openai(
     else:
         # Multiple chunks — synthesize each and combine
         chunk_paths = []
-        for i, chunk in enumerate(chunks):
-            chunk_path = tempfile.mktemp(suffix=f"_chunk_{i}.mp3")
-            response = client.audio.speech.create(
-                model=model_name,
-                voice=voice_name,
-                input=chunk,
-            )
-            response.stream_to_file(chunk_path)
-            chunk_paths.append(chunk_path)
+        try:
+            for i, chunk in enumerate(chunks):
+                chunk_path = _temporary_path(f"_chunk_{i}.mp3")
+                response = client.audio.speech.create(
+                    model=model_name,
+                    voice=voice_name,
+                    input=chunk,
+                )
+                response.stream_to_file(chunk_path)
+                chunk_paths.append(chunk_path)
+        except Exception:
+            for chunk_path in chunk_paths:
+                try:
+                    os.remove(chunk_path)
+                except OSError:
+                    pass
+            raise
 
         # Combine using pydub
         try:
@@ -105,12 +119,17 @@ def synthesize_openai(
             raise ImportError("pydub not installed. Run: pip install pydub")
 
         combined = AudioSegment.empty()
-        for cp in chunk_paths:
-            seg = AudioSegment.from_mp3(cp)
-            combined += seg
-            os.remove(cp)
-
-        combined.export(output_path, format="mp3")
+        try:
+            for cp in chunk_paths:
+                seg = AudioSegment.from_mp3(cp)
+                combined += seg
+            combined.export(output_path, format="mp3")
+        finally:
+            for cp in chunk_paths:
+                try:
+                    os.remove(cp)
+                except OSError:
+                    pass
 
     return output_path
 
@@ -134,7 +153,7 @@ def synthesize_openrouter(
         )
 
     voice_name = voice or config.OPENROUTER_TTS_VOICE
-    output_path = output_path or tempfile.mktemp(suffix=".mp3")
+    output_path = output_path or _temporary_path(".mp3")
 
     os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
 

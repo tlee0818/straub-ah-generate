@@ -15,9 +15,15 @@ from podcast_worker.core.tts_engine import synthesize, convert_to_wav
 from podcast_worker.core.beat_generator import save_beat_to_wav
 from podcast_worker.core.audio_mixer import build_podcast_audio, convert_to_mp3
 from podcast_worker.core.dependencies import resolve_llm_key
+from podcast_worker.core.config import settings
 from podcast_worker.main import state
 
 router = APIRouter(tags=["jobs"])
+_generation_slots = threading.BoundedSemaphore(settings.max_concurrent_generations)
+
+
+def _public_result(result: dict) -> dict:
+    return {key: value for key, value in result.items() if key not in {"audio_path", "mp3_path"}}
 
 
 def _run_full_generation(job_id: str, req: GenerateRequest):
@@ -99,18 +105,22 @@ def _run_full_generation(job_id: str, req: GenerateRequest):
                 "mp3_path": final_path if final_path != podcast_wav else None,
             },
         })
-    except Exception as e:
+    except Exception:
         state.jobs[job_id].update({
             "status": "failed",
             "progress": "Failed.",
-            "error": str(e),
+            "error": "Generation failed.",
             "completed_at": datetime.now(timezone.utc).isoformat(),
         })
+    finally:
+        _generation_slots.release()
 
 
 @router.post("/api/services/generate", status_code=202)
 async def generate_podcast(req: GenerateRequest):
     """Start full podcast generation asynchronously. Returns job_id for polling."""
+    if not _generation_slots.acquire(blocking=False):
+        raise HTTPException(status_code=503, detail="Generation capacity is full.")
     job_id = str(uuid.uuid4())
     created_at = datetime.now(timezone.utc).isoformat()
 
@@ -154,7 +164,7 @@ async def get_job_status(job_id: str):
     }
 
     if job["status"] == "completed" and job.get("result"):
-        resp["result"] = job["result"]
+        resp["result"] = _public_result(job["result"])
 
     return resp
 

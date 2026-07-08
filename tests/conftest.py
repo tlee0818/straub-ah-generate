@@ -1,5 +1,6 @@
 """pytest configuration for the services test suite."""
 import os
+os.environ.setdefault("PODCAST_ALLOW_INSECURE_DEV_AUTH", "true")
 import sys
 
 # Add the services/ root so we can import from podcast_worker.core

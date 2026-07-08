@@ -28,8 +28,20 @@ def _db_path() -> str:
 
 
 def _output_dir() -> str:
+    configured = Path(settings.output_dir)
+    if configured.is_absolute():
+        return str(configured)
     project_root = Path(__file__).resolve().parent.parent.parent
-    return str(project_root / "output")
+    return str(project_root / configured)
+
+
+def _safe_output_path(out_dir: Path, filename: str) -> Path | None:
+    candidate = (out_dir / filename).resolve()
+    try:
+        candidate.relative_to(out_dir.resolve())
+    except ValueError:
+        return None
+    return candidate
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -80,21 +92,19 @@ async def download_artifact(artifact_id: str, owner_id: str = Depends(require_au
                 ).model_dump(),
             )
 
-    # Locate the file on disk
+    # Locate the file on disk without allowing DB-contaminated ids to escape output_dir.
     out_dir = Path(_output_dir())
-    # Try to find the file by artifact_id pattern
     content_type = artifact.get("content_type", "audio/mpeg")
     media_type = content_type
-
-    # Try common patterns: segment audio, final mp3
-    candidate_paths = [
-        out_dir / f"mixed_{artifact.get('segment_id', '')}.mp3",
-        out_dir / f"final_{project_id}.mp3",
-        out_dir / f"speech_{artifact.get('segment_id', '')}.mp3",
+    candidate_names = [
+        f"mixed_{artifact.get('segment_id', '')}.mp3",
+        f"final_{project_id}.mp3",
+        f"speech_{artifact.get('segment_id', '')}.mp3",
     ]
 
-    for candidate in candidate_paths:
-        if candidate.exists():
+    for name in candidate_names:
+        candidate = _safe_output_path(out_dir, name)
+        if candidate and candidate.exists() and candidate.is_file():
             return FileResponse(
                 path=str(candidate),
                 media_type=media_type,

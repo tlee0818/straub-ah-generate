@@ -33,6 +33,7 @@ from podcast_worker.core.models_v1 import (
 from podcast_worker.core.segment_pipeline import run_project_pipeline
 
 router = APIRouter(prefix="/api/v1/projects", tags=["v1-projects"])
+_generation_slots = threading.BoundedSemaphore(settings.max_concurrent_generations)
 
 
 def _db_path() -> str:
@@ -40,12 +41,22 @@ def _db_path() -> str:
 
 
 def _output_dir() -> str:
+    configured = Path(settings.output_dir)
+    if configured.is_absolute():
+        return str(configured)
     project_root = Path(__file__).resolve().parent.parent.parent
-    return str(project_root / "output")
+    return str(project_root / configured)
 
 
 def _short_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:12]}"
+
+
+def _run_project_pipeline_with_slot(*args) -> None:
+    try:
+        run_project_pipeline(*args)
+    finally:
+        _generation_slots.release()
 
 
 def _project_not_found(project_id: str) -> HTTPException:
@@ -142,6 +153,8 @@ async def create_project(
     """Create a durable PodcastProject and start backend generation."""
     project_id = _short_id("prj")
     db = _db_path()
+    if not _generation_slots.acquire(blocking=False):
+        raise HTTPException(status_code=503, detail="Generation capacity is full.")
 
     project = await persistence.create_project(
         db, project_id, owner_id, req.topic, req.bpm, req.duration_minutes,
@@ -152,7 +165,7 @@ async def create_project(
     interviewer_profile = req.interviewer_profile.model_dump(exclude_none=True) if req.interviewer_profile else None
     sme_profile = req.sme_profile.model_dump(exclude_none=True) if req.sme_profile else None
     thread = threading.Thread(
-        target=run_project_pipeline,
+        target=_run_project_pipeline_with_slot,
         args=(db, project_id, _output_dir(), req.topic,
               req.bpm, req.duration_minutes, req.voice_id, outline,
               interviewer_profile, sme_profile),

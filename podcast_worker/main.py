@@ -25,7 +25,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException, Request, UploadFile, File, Form
+from fastapi import Depends, FastAPI, HTTPException, Request, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse
 
@@ -109,11 +109,14 @@ app = FastAPI(
 )
 
 # CORS — configurable via PODCAST_CORS_ORIGINS env var
-_cors_origins = cfg.CORS_ORIGINS.split(",") if cfg.CORS_ORIGINS != "*" else ["*"]
+_cors_origins = (
+    ["*"] if cfg.CORS_ORIGINS.strip() == "*"
+    else [origin.strip() for origin in cfg.CORS_ORIGINS.split(",") if origin.strip()]
+)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_origins,
-    allow_credentials=True,
+    allow_credentials=_cors_origins != ["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -133,11 +136,12 @@ app.include_router(v1_artifacts.router)
 # ---------------------------------------------------------------------------
 
 from podcast_worker.routers import health, jobs, audio, scripts
+from podcast_worker.core.auth import require_auth
 
 app.include_router(health.router)
-app.include_router(jobs.router)
-app.include_router(audio.router)
-app.include_router(scripts.router)
+app.include_router(jobs.router, dependencies=[Depends(require_auth)])
+app.include_router(audio.router, dependencies=[Depends(require_auth)])
+app.include_router(scripts.router, dependencies=[Depends(require_auth)])
 
 # ---------------------------------------------------------------------------
 # v1 error handlers

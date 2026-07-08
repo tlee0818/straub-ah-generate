@@ -55,8 +55,8 @@ async def generate_script_endpoint(req: ScriptRequest):
             model=req.model,
         )
         return {"status": "ok", "script": script}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        raise HTTPException(status_code=500, detail="Script generation failed.")
 
 
 @router.post("/api/services/generate-outline")
@@ -73,8 +73,8 @@ async def generate_outline_endpoint(req: ScriptRequest):
             model=req.model,
         )
         return {"status": "ok", "outline": outline}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        raise HTTPException(status_code=500, detail="Outline generation failed.")
 
 
 @router.post("/api/services/scripts", status_code=201)
@@ -110,8 +110,8 @@ async def create_script(req: ScriptStoreRequest):
             "script": script,
             "created_at": now,
         }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        raise HTTPException(status_code=500, detail="Script creation failed.")
 
 
 @router.get("/api/services/scripts")
@@ -180,8 +180,8 @@ async def generate_follow_up(script_id: str, req: FollowUpRequest):
             "script_id": script_id,
             "follow_up_questions": questions,
         }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        raise HTTPException(status_code=500, detail="Follow-up generation failed.")
 
 
 @router.post("/api/services/scripts/{script_id}/summary")
@@ -206,5 +206,5 @@ async def generate_summary(script_id: str, req: SummaryRequest):
             "script_id": script_id,
             "summary": summary,
         }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    except Exception:
+        raise HTTPException(status_code=500, detail="Summary generation failed.")
