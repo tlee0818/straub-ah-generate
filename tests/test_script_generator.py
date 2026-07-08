@@ -120,6 +120,9 @@ class TestScriptGenerationFlow:
                 return research_brief
             if "subtopic research agent" in system_prompt:
                 return research_responses[len([call for call in calls if "subtopic research agent" in call[0]]) - 1]
+            if "factfulness verification agent" in system_prompt:
+                verified_index = len([call for call in calls if "factfulness verification agent" in call[0]]) - 1
+                return {"is_factful": True, "issues": [], "verified_text": section_responses[verified_index]["text"]}
             return section_responses[len([call for call in calls if "script writer" in call[0]]) - 1]
 
         monkeypatch.setattr(script_generator, "_call_provider", fake_call_provider)
@@ -158,22 +161,25 @@ class TestScriptGenerationFlow:
                 },
             ],
         }
-        assert len(calls) == 8
+        assert len(calls) == 11
         assert "outline planner" in calls[0][0]
         assert "sections" in calls[0][1]
         assert "lead research agent" in calls[1][0]
         assert all("subtopic research agent" in call[0] for call in calls[2:5])
-        assert all("script writer" in call[0] for call in calls[5:])
+        assert all("script writer" in call[0] for call in (calls[5], calls[7], calls[9]))
+        assert all("factfulness verification agent" in call[0] for call in (calls[6], calls[8], calls[10]))
         assert all(call[2] == "test-provider" for call in calls)
         assert calls[0][3] == {"model": "test-model"}
 
-        second_section_prompt = calls[6][1]
+        second_section_prompt = calls[7][1]
         assert "FULL OUTLINE" in second_section_prompt
         assert "PREVIOUS SECTION TOPIC: Hook" in second_section_prompt
         assert "CURRENT SECTION TOPIC: Risk framing" in second_section_prompt
         assert "NEXT SECTION TOPIC: Takeaway" in second_section_prompt
         assert "IMMEDIATELY PREVIOUS SECTION TEXT:\nIntro text." in second_section_prompt
         assert "RESEARCH CONTEXT" in second_section_prompt
+        assert "Interviewer" in second_section_prompt
+        assert "SME guest" in second_section_prompt
         assert "Risk research" in second_section_prompt
 
 class TestFollowUpPrompt:
@@ -325,6 +331,9 @@ class TestPipelineSegmentCreation:
                 return {"research_brief": "Brief"}
             if "subtopic research agent" in system_prompt:
                 return {"key_points": ["Research point"]}
+            if "factfulness verification agent" in system_prompt:
+                verified_index = len([prompt for prompt in prompts if "DRAFT DIALOGUE:" not in prompt]) - 1
+                return {"is_factful": True, "issues": [], "verified_text": section_texts[verified_index]["text"]}
             prompts.append(user_prompt)
             return section_texts[len(prompts) - 1]
 

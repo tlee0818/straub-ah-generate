@@ -116,6 +116,16 @@ class OutlinePreviewRequest(BaseModel):
     llm_profile_id: Optional[str] = Field(default="default", description="Server-defined safe LLM profile id")
 
 
+class SpeakerProfile(BaseModel):
+    """Dialogue speaker profile used by script generation prompts."""
+    name: Optional[str] = Field(default=None, max_length=80, description="Display name or role label")
+    voice: Optional[str] = Field(default=None, max_length=120, description="Voice description or future voice id")
+    tone: Optional[str] = Field(default=None, max_length=120, description="Speaking tone")
+    humor: Optional[str] = Field(default=None, max_length=120, description="Humor level/style")
+    style: Optional[str] = Field(default=None, max_length=160, description="Interviewing or expertise style")
+    expertise: Optional[str] = Field(default=None, max_length=160, description="SME expertise framing")
+
+
 
 class ProjectCreateRequest(BaseModel):
     """POST /api/v1/projects — user intent only; provider secrets are server-side."""
@@ -126,6 +136,8 @@ class ProjectCreateRequest(BaseModel):
     llm_profile_id: Optional[str] = Field(default="default", description="Server-defined safe LLM profile id")
     tts_profile_id: Optional[str] = Field(default="default", description="Server-defined safe TTS profile id")
     approved_outline: Optional[ProjectOutlineResponse] = Field(default=None, description="User-reviewed outline to use for script generation")
+    interviewer_profile: Optional[SpeakerProfile] = Field(default=None, description="Interviewer voice, tone, humor, and style")
+    sme_profile: Optional[SpeakerProfile] = Field(default=None, description="Subject matter expert guest voice, tone, humor, and expertise")
 
 
 class TransferUrlRequest(BaseModel):

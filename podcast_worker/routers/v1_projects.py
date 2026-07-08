@@ -149,10 +149,13 @@ async def create_project(
 
     # Start background segment generation in a daemon thread
     outline = _outline_response_to_generator(req.approved_outline)
+    interviewer_profile = req.interviewer_profile.model_dump(exclude_none=True) if req.interviewer_profile else None
+    sme_profile = req.sme_profile.model_dump(exclude_none=True) if req.sme_profile else None
     thread = threading.Thread(
         target=run_project_pipeline,
         args=(db, project_id, _output_dir(), req.topic,
-              req.bpm, req.duration_minutes, req.voice_id, outline),
+              req.bpm, req.duration_minutes, req.voice_id, outline,
+              interviewer_profile, sme_profile),
         daemon=True,
     )
     thread.start()

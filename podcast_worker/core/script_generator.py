@@ -196,6 +196,17 @@ Each content section should be 30-60 seconds of natural speech.
 """
 
 
+def _speaker_profile(label: str, profile: Optional[dict]) -> str:
+    """Format a compact dynamic persona instead of creating per-run files."""
+    profile = profile or {}
+    name = profile.get("name") or label
+    voice = profile.get("voice") or "natural conversational voice"
+    tone = profile.get("tone") or "curious, warm, and precise"
+    humor = profile.get("humor") or "light and occasional"
+    style = profile.get("style") or profile.get("expertise") or "clear and accessible"
+    return f"{label}: name={name}; voice={voice}; tone={tone}; humor={humor}; style={style}"
+
+
 def _format_outline_for_prompt(outline: dict) -> str:
     """Format the full outline for section-generation prompts."""
     lines = [f"TITLE: {outline.get('title', 'Untitled')}"]
@@ -277,6 +288,16 @@ def _format_research_for_prompt(research_brief: dict, section_research: dict) ->
     )
 
 
+def _format_speaker_profiles(interviewer_profile: Optional[dict], sme_profile: Optional[dict]) -> str:
+    """Format the two dialogue agents for prompt context."""
+    return "\n".join(
+        [
+            _speaker_profile("Interviewer", interviewer_profile),
+            _speaker_profile("SME guest", sme_profile),
+        ]
+    )
+
+
 def _get_section_prompt(
     topic: str,
     bpm: int,
@@ -287,6 +308,8 @@ def _get_section_prompt(
     previous_section_text: str,
     research_brief: Optional[dict] = None,
     section_research: Optional[dict] = None,
+    interviewer_profile: Optional[dict] = None,
+    sme_profile: Optional[dict] = None,
     duration_minutes: int = 5,
 ) -> str:
     """Build a prompt for generating one outlined section."""
@@ -325,12 +348,15 @@ IMMEDIATELY PREVIOUS SECTION TEXT:
 RESEARCH CONTEXT:
 {_format_research_for_prompt(research_brief or {}, section_research or {})}
 
-Write ONLY the current section. Use the previous section text for continuity, but do not repeat it. Use the research context for specificity, examples, nuance, and intriguing framing. Lead naturally toward the next topic when one exists.
+SPEAKER AGENTS:
+{_format_speaker_profiles(interviewer_profile, sme_profile)}
+
+Write ONLY the current section as a natural two-person podcast dialogue between the Interviewer and the SME guest. The interviewer should ask sharp, curious follow-ups and steer pacing; the SME should provide expertise, examples, and nuance. Use the previous section text for continuity, but do not repeat it. Use the research context for specificity, examples, nuance, and intriguing framing. Lead naturally toward the next topic when one exists.
 
 Return ONLY valid JSON with this exact structure:
 {{
     "segment_type": "{segment_type}",
-    "text": "The current section script text...",
+    "text": "Interviewer: Question or setup.\\nSME: Expert answer.\\nInterviewer: Follow-up...",
     "approx_duration_seconds": {duration}
 }}
 """
@@ -450,12 +476,69 @@ def generate_subtopic_research(
     )
 
 
+def _get_fact_check_prompt(
+    topic: str,
+    outline: dict,
+    section: dict,
+    research_brief: dict,
+    section_research: dict,
+    generated_text: str,
+) -> str:
+    """Build a prompt for the factfulness verification agent."""
+    section_topic = section.get("topic") or section.get("title") or topic
+    return f"""You are the factfulness verification agent for a dialogue podcast script.
+
+EPISODE TOPIC: {topic}
+SECTION TOPIC: {section_topic}
+
+FULL OUTLINE:
+{_format_outline_for_prompt(outline)}
+
+RESEARCH CONTEXT:
+{_format_research_for_prompt(research_brief, section_research)}
+
+DRAFT DIALOGUE:
+{generated_text}
+
+Verify that the dialogue is faithful to the research context, does not overstate uncertain claims, and keeps the interviewer/SME roles clear. If a correction is needed, return corrected dialogue in verified_text. Preserve the two-speaker dialogue format.
+
+Return ONLY valid JSON with this exact structure:
+{{
+    "is_factful": true,
+    "issues": ["Issue or empty list"],
+    "verified_text": "Corrected or unchanged dialogue text"
+}}
+"""
+
+
+def verify_section_factfulness(
+    topic: str,
+    outline: dict,
+    section: dict,
+    research_brief: dict,
+    section_research: dict,
+    generated_text: str,
+    provider: Optional[str] = None,
+    **kwargs,
+) -> dict:
+    """Run the factfulness verification-agent step for one generated section."""
+    return _call_provider(
+        "You are a factfulness verification agent for a podcast production team. You output raw JSON only.",
+        _get_fact_check_prompt(topic, outline, section, research_brief, section_research, generated_text),
+        provider=provider,
+        temperature=0.2,
+        **kwargs,
+    )
+
+
 def generate_script(
     topic: str,
     bpm: int,
     duration_minutes: int = 5,
     provider: Optional[str] = None,
     outline: Optional[dict] = None,
+    interviewer_profile: Optional[dict] = None,
+    sme_profile: Optional[dict] = None,
     **kwargs,
 ) -> dict:
     """Generate a podcast script using outline-first section generation."""
@@ -504,6 +587,8 @@ def generate_script(
             previous_section_text,
             research_brief,
             section_research_items[index],
+            interviewer_profile,
+            sme_profile,
             duration_minutes,
         )
         generated_section = _call_provider(
@@ -513,6 +598,17 @@ def generate_script(
             **kwargs,
         )
         segment = generated_section.get("segment", generated_section)
+        verification = verify_section_factfulness(
+            topic=topic,
+            outline=outline,
+            section=section,
+            research_brief=research_brief,
+            section_research=section_research_items[index],
+            generated_text=segment.get("text", ""),
+            provider=provider,
+            **kwargs,
+        )
+        verified_text = verification.get("verified_text") or segment.get("text", "")
         generated_segments.append(
             {
                 "segment_type": segment.get(
@@ -521,7 +617,7 @@ def generate_script(
                 ),
                 "subtopic": section.get("topic") or section.get("title") or topic,
                 "title": section.get("title") or section.get("topic"),
-                "text": segment.get("text", ""),
+                "text": verified_text,
                 "approx_duration_seconds": segment.get(
                     "approx_duration_seconds",
                     section.get("approx_duration_seconds", 45),
