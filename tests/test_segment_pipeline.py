@@ -85,7 +85,14 @@ def _install_audio_fakes(monkeypatch, assembled_paths: list[str]) -> None:
     monkeypatch.setitem(sys.modules, "pydub", SimpleNamespace(AudioSegment=AudioSegment))
     monkeypatch.setattr(segment_pipeline, "convert_to_wav", lambda *_: None)
     monkeypatch.setattr(segment_pipeline, "build_podcast_audio", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(segment_pipeline, "convert_to_mp3", lambda *_: None)
+    monkeypatch.setattr(
+        segment_pipeline, "convert_to_mp3",
+        lambda _wav, mp3: Path(mp3).write_bytes(b"combined"),
+    )
+    monkeypatch.setattr(
+        segment_pipeline, "_validated_audio_metadata",
+        lambda _path: (0.5, -18.0, 0.5),
+    )
     monkeypatch.setattr(segment_pipeline, "_sync_add_artifact", lambda *_: None)
     monkeypatch.setattr(segment_pipeline, "_sync_update_segment_status", lambda *_: None)
     monkeypatch.setattr(segment_pipeline, "_sync_upsert_provenance", lambda *_: None)
@@ -154,10 +161,10 @@ class TestParallelElevenLabsSegments:
                 worker.join(2)
 
         assert worker_error == []
-        assert set(starts) == {"scene-0", "scene-1", "scene-2"}
+        assert {plan_id.rsplit(":", 1)[-1] for plan_id in starts} == {"scene-0", "scene-1", "scene-2"}
         assert active["maximum"] == 2
         assert len(set(assembled)) == 3
-        assert [Path(path).name for path in assembled] == ["speech_segment-scene-0.mp3", "speech_segment-scene-1.mp3", "speech_segment-scene-2.mp3"]
+        assert [Path(path).name.rsplit(":", 1)[-1] for path in assembled] == ["scene-0.mp3", "scene-1.mp3", "scene-2.mp3"]
         conn = sqlite3.connect(db_path)
         attempts = conn.execute(
             "SELECT attempt_id, plan_id, outcome FROM execution_attempts ORDER BY plan_id, created_at"
@@ -168,10 +175,10 @@ class TestParallelElevenLabsSegments:
         conn.close()
         assert len({attempt[0] for attempt in attempts}) == 3
         assert {(attempt[1], attempt[2]) for attempt in attempts} == {
-            ("scene-0", "published"), ("scene-1", "published"), ("scene-2", "published"),
+            ("project:segment:scene-0", "published"), ("project:segment:scene-1", "published"), ("project:segment:scene-2", "published"),
         }
         assert len(ledger_entries) == 9
-        assert {entry[0] for entry in ledger_entries} == {"scene-0", "scene-1", "scene-2"}
+        assert {entry[0].rsplit(":", 1)[-1] for entry in ledger_entries} == {"scene-0", "scene-1", "scene-2"}
 
     def test_maximum_one_is_sequential(self, monkeypatch, tmp_path):
         from podcast_worker.core import tts_engine
@@ -200,7 +207,7 @@ class TestParallelElevenLabsSegments:
             db_path, "project", segment, str(tmp_path), tmp_path / "beat.mp3",
             120, 1, None, "model", _tts_snapshot(1), "ledger",
         )
-        assert starts == ["scene-0", "scene-1", "scene-2"]
+        assert starts == ["project:segment:scene-0", "project:segment:scene-1", "project:segment:scene-2"]
         assert active["maximum"] == 1
 
     def test_dispatched_failure_marks_only_that_attempt_unknown_and_blocks_assembly(self, monkeypatch, tmp_path):
@@ -228,13 +235,24 @@ class TestParallelElevenLabsSegments:
         attempts = conn.execute("SELECT plan_id, outcome FROM execution_attempts").fetchall()
         assemblies = conn.execute("SELECT COUNT(*) FROM audio_assemblies").fetchone()[0]
         conn.close()
-        assert dispatched[0] == "scene-0"
-        assert set(dispatched).issubset({"scene-0", "scene-1"})
+        assert dispatched[0] == "project:segment:scene-0"
+        assert set(dispatched).issubset({"project:segment:scene-0", "project:segment:scene-1"})
         assert set(attempts) == {(plan_id, "unknown_outcome") for plan_id in dispatched}
         assert assemblies == 0
         assert "ready" not in statuses
         assert publications == []
         assert assembled == []
+    def test_provider_diagnostic_is_redacted_from_segment_manifest(self, tmp_path):
+        db_path, segment = _parallel_pipeline_db(tmp_path, "Interviewer: Zero.")
+        segment_pipeline._persist_segment_failure(
+            db_path, segment["segment_id"], segment_pipeline._public_error_code(RuntimeError("secret token"))
+        )
+
+        conn = sqlite3.connect(db_path)
+        error = conn.execute("SELECT error_message FROM segments WHERE segment_id = ?", (segment["segment_id"],)).fetchone()[0]
+        conn.close()
+        assert error == "generation_failed"
+
 
 
 class TestPurposeRouting:

@@ -1,0 +1,3379 @@
+{
+  "components": {
+    "schemas": {
+      "Artifact": {
+        "description": "Durable media or generation output metadata.",
+        "properties": {
+          "artifact_id": {
+            "description": "Stable canonical artifact identifier",
+            "title": "Artifact Id",
+            "type": "string"
+          },
+          "checksum_sha256": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Cache and integrity validator",
+            "title": "Checksum Sha256"
+          },
+          "content_type": {
+            "description": "MIME type, e.g. audio/mpeg",
+            "title": "Content Type",
+            "type": "string"
+          },
+          "created_at": {
+            "title": "Created At",
+            "type": "string"
+          },
+          "download_url": {
+            "description": "Authenticated API endpoint for this artifact",
+            "title": "Download Url",
+            "type": "string"
+          },
+          "duration_seconds": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Present for audio when known",
+            "title": "Duration Seconds"
+          },
+          "kind": {
+            "description": "segment_audio | final_mp3 | script_json",
+            "title": "Kind",
+            "type": "string"
+          },
+          "segment_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Present for segment artifacts",
+            "title": "Segment Id"
+          },
+          "signed_transfer_expires_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Required when signed URL is present",
+            "title": "Signed Transfer Expires At"
+          },
+          "signed_transfer_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Optional short-lived transfer URL",
+            "title": "Signed Transfer Url"
+          },
+          "size_bytes": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Present when stored",
+            "title": "Size Bytes"
+          },
+          "status": {
+            "default": "pending",
+            "description": "pending | ready | failed | deleted",
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "artifact_id",
+          "kind",
+          "content_type",
+          "download_url"
+        ],
+        "title": "Artifact",
+        "type": "object"
+      },
+      "AudioRequest": {
+        "properties": {
+          "api_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Api Key"
+          },
+          "bpm": {
+            "maximum": 220.0,
+            "minimum": 60.0,
+            "title": "Bpm",
+            "type": "integer"
+          },
+          "duration_minutes": {
+            "default": 5,
+            "maximum": 30.0,
+            "minimum": 1.0,
+            "title": "Duration Minutes",
+            "type": "integer"
+          },
+          "openrouter_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Openrouter Key"
+          },
+          "speech_text": {
+            "maxLength": 20000,
+            "minLength": 1,
+            "title": "Speech Text",
+            "type": "string"
+          },
+          "tts_model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tts Model"
+          },
+          "tts_provider": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tts Provider"
+          },
+          "voice": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Voice"
+          }
+        },
+        "required": [
+          "speech_text",
+          "bpm"
+        ],
+        "title": "AudioRequest",
+        "type": "object"
+      },
+      "BeatRequest": {
+        "properties": {
+          "bpm": {
+            "maximum": 220.0,
+            "minimum": 60.0,
+            "title": "Bpm",
+            "type": "integer"
+          },
+          "duration_seconds": {
+            "exclusiveMinimum": 0.0,
+            "maximum": 1800.0,
+            "title": "Duration Seconds",
+            "type": "number"
+          }
+        },
+        "required": [
+          "bpm",
+          "duration_seconds"
+        ],
+        "title": "BeatRequest",
+        "type": "object"
+      },
+      "Body_overlay_audio_endpoint_api_services_overlay_audio_post": {
+        "properties": {
+          "beat_wav": {
+            "contentMediaType": "application/octet-stream",
+            "title": "Beat Wav",
+            "type": "string"
+          },
+          "bpm": {
+            "maximum": 220.0,
+            "minimum": 60.0,
+            "title": "Bpm",
+            "type": "integer"
+          },
+          "duration_minutes": {
+            "default": 5,
+            "maximum": 30.0,
+            "minimum": 1.0,
+            "title": "Duration Minutes",
+            "type": "integer"
+          },
+          "intro_seconds": {
+            "default": 4.0,
+            "maximum": 30.0,
+            "minimum": 0.0,
+            "title": "Intro Seconds",
+            "type": "number"
+          },
+          "outro_seconds": {
+            "default": 6.0,
+            "maximum": 30.0,
+            "minimum": 0.0,
+            "title": "Outro Seconds",
+            "type": "number"
+          },
+          "speech_wav": {
+            "contentMediaType": "application/octet-stream",
+            "title": "Speech Wav",
+            "type": "string"
+          }
+        },
+        "required": [
+          "speech_wav",
+          "beat_wav",
+          "bpm"
+        ],
+        "title": "Body_overlay_audio_endpoint_api_services_overlay_audio_post",
+        "type": "object"
+      },
+      "ConfigResponse": {
+        "description": "GET /api/v1/config \u2014 safe for iOS to display.",
+        "properties": {
+          "bpm_range": {
+            "additionalProperties": true,
+            "title": "Bpm Range",
+            "type": "object"
+          },
+          "default_llm_profile_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Default Llm Profile Id"
+          },
+          "default_tts_profile_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Default Tts Profile Id"
+          },
+          "duration_minutes_range": {
+            "additionalProperties": true,
+            "title": "Duration Minutes Range",
+            "type": "object"
+          },
+          "llm_profiles": {
+            "items": {
+              "$ref": "#/components/schemas/LLMProfileSummary"
+            },
+            "title": "Llm Profiles",
+            "type": "array"
+          },
+          "tts_profiles": {
+            "items": {
+              "$ref": "#/components/schemas/TTSProfileSummary"
+            },
+            "title": "Tts Profiles",
+            "type": "array"
+          },
+          "voices": {
+            "items": {
+              "$ref": "#/components/schemas/VoiceProfile"
+            },
+            "title": "Voices",
+            "type": "array"
+          }
+        },
+        "title": "ConfigResponse",
+        "type": "object"
+      },
+      "FollowUpRequest": {
+        "description": "Request to generate follow-up questions for an existing script.",
+        "properties": {
+          "api_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Api Key"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "openrouter_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Openrouter Key"
+          },
+          "provider": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Provider"
+          },
+          "topic": {
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Topic",
+            "type": "string"
+          }
+        },
+        "required": [
+          "topic"
+        ],
+        "title": "FollowUpRequest",
+        "type": "object"
+      },
+      "GenerateRequest": {
+        "properties": {
+          "api_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Api Key"
+          },
+          "bpm": {
+            "maximum": 220.0,
+            "minimum": 60.0,
+            "title": "Bpm",
+            "type": "integer"
+          },
+          "duration_minutes": {
+            "default": 5,
+            "maximum": 30.0,
+            "minimum": 1.0,
+            "title": "Duration Minutes",
+            "type": "integer"
+          },
+          "llm_model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Llm Model"
+          },
+          "llm_provider": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Llm Provider"
+          },
+          "openrouter_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Openrouter Key"
+          },
+          "topic": {
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Topic",
+            "type": "string"
+          },
+          "tts_model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tts Model"
+          },
+          "tts_provider": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tts Provider"
+          },
+          "voice": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Voice"
+          }
+        },
+        "required": [
+          "topic",
+          "bpm"
+        ],
+        "title": "GenerateRequest",
+        "type": "object"
+      },
+      "HTTPValidationError": {
+        "properties": {
+          "detail": {
+            "items": {
+              "$ref": "#/components/schemas/ValidationError"
+            },
+            "title": "Detail",
+            "type": "array"
+          }
+        },
+        "title": "HTTPValidationError",
+        "type": "object"
+      },
+      "LLMProfileSummary": {
+        "properties": {
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "id": {
+            "pattern": "^[a-z0-9][a-z0-9-]{0,63}$",
+            "title": "Id",
+            "type": "string"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "label"
+        ],
+        "title": "LLMProfileSummary",
+        "type": "object"
+      },
+      "OutlinePreviewRequest": {
+        "description": "POST /api/v1/projects/outline-preview \u2014 generate a reviewable outline first.",
+        "properties": {
+          "bpm": {
+            "description": "Beats per minute",
+            "maximum": 220.0,
+            "minimum": 60.0,
+            "title": "Bpm",
+            "type": "integer"
+          },
+          "duration_minutes": {
+            "default": 5,
+            "description": "Target duration in minutes",
+            "maximum": 30.0,
+            "minimum": 1.0,
+            "title": "Duration Minutes",
+            "type": "integer"
+          },
+          "llm_profile_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": "default",
+            "description": "Server-defined safe LLM profile id",
+            "title": "Llm Profile Id"
+          },
+          "topic": {
+            "description": "Podcast topic",
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Topic",
+            "type": "string"
+          },
+          "tts_profile_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Server-defined safe TTS profile id",
+            "title": "Tts Profile Id"
+          }
+        },
+        "required": [
+          "topic",
+          "bpm"
+        ],
+        "title": "OutlinePreviewRequest",
+        "type": "object"
+      },
+      "OutlinePreviewResponse": {
+        "description": "Safe, immutable profile binding for an outline preview.",
+        "properties": {
+          "expires_at": {
+            "title": "Expires At",
+            "type": "string"
+          },
+          "llm_profile_id": {
+            "title": "Llm Profile Id",
+            "type": "string"
+          },
+          "outline_preview_id": {
+            "title": "Outline Preview Id",
+            "type": "string"
+          },
+          "project_id": {
+            "title": "Project Id",
+            "type": "string"
+          },
+          "routing_revision": {
+            "title": "Routing Revision",
+            "type": "string"
+          },
+          "sections": {
+            "items": {
+              "$ref": "#/components/schemas/OutlineSection"
+            },
+            "title": "Sections",
+            "type": "array"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          },
+          "topic": {
+            "title": "Topic",
+            "type": "string"
+          },
+          "tts_profile_id": {
+            "title": "Tts Profile Id",
+            "type": "string"
+          },
+          "tts_routing_revision": {
+            "title": "Tts Routing Revision",
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_id",
+          "topic",
+          "title",
+          "outline_preview_id",
+          "llm_profile_id",
+          "tts_profile_id",
+          "routing_revision",
+          "tts_routing_revision",
+          "expires_at"
+        ],
+        "title": "OutlinePreviewResponse",
+        "type": "object"
+      },
+      "OutlineSection": {
+        "description": "One planned script section derived from project segments.",
+        "properties": {
+          "approx_duration_seconds": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Planned or generated section duration",
+            "title": "Approx Duration Seconds"
+          },
+          "index": {
+            "description": "Playback order within the project",
+            "title": "Index",
+            "type": "integer"
+          },
+          "segment_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Segment id when the section has been created",
+            "title": "Segment Id"
+          },
+          "segment_type": {
+            "default": "content",
+            "description": "intro | content | outro",
+            "title": "Segment Type",
+            "type": "string"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "User-facing section title",
+            "title": "Title"
+          },
+          "topic": {
+            "description": "Planned section topic",
+            "title": "Topic",
+            "type": "string"
+          }
+        },
+        "required": [
+          "index",
+          "topic"
+        ],
+        "title": "OutlineSection",
+        "type": "object"
+      },
+      "PodcastProjectResponse": {
+        "description": "Full canonical PodcastProject manifest (GET /api/v1/projects/{id}).",
+        "properties": {
+          "artifacts": {
+            "items": {
+              "$ref": "#/components/schemas/Artifact"
+            },
+            "title": "Artifacts",
+            "type": "array"
+          },
+          "bpm": {
+            "title": "Bpm",
+            "type": "integer"
+          },
+          "created_at": {
+            "title": "Created At",
+            "type": "string"
+          },
+          "deleted_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Deleted At"
+          },
+          "duration_minutes": {
+            "title": "Duration Minutes",
+            "type": "integer"
+          },
+          "errors": {
+            "items": {
+              "$ref": "#/components/schemas/ProjectError"
+            },
+            "title": "Errors",
+            "type": "array"
+          },
+          "final_artifact_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Final Artifact Id"
+          },
+          "final_download_ready": {
+            "default": false,
+            "title": "Final Download Ready",
+            "type": "boolean"
+          },
+          "owner_id": {
+            "title": "Owner Id",
+            "type": "string"
+          },
+          "project_id": {
+            "title": "Project Id",
+            "type": "string"
+          },
+          "revision_token": {
+            "title": "Revision Token",
+            "type": "string"
+          },
+          "segments": {
+            "items": {
+              "$ref": "#/components/schemas/Segment"
+            },
+            "title": "Segments",
+            "type": "array"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "topic": {
+            "title": "Topic",
+            "type": "string"
+          },
+          "updated_at": {
+            "title": "Updated At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_id",
+          "owner_id",
+          "topic",
+          "bpm",
+          "duration_minutes",
+          "status",
+          "revision_token",
+          "created_at",
+          "updated_at"
+        ],
+        "title": "PodcastProjectResponse",
+        "type": "object"
+      },
+      "ProjectCreateRequest": {
+        "description": "POST /api/v1/projects \u2014 user intent only; provider secrets are server-side.",
+        "properties": {
+          "approved_outline": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ProjectOutlineResponse"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "User-reviewed outline to use for script generation"
+          },
+          "bpm": {
+            "description": "Beats per minute",
+            "maximum": 220.0,
+            "minimum": 60.0,
+            "title": "Bpm",
+            "type": "integer"
+          },
+          "duration_minutes": {
+            "default": 5,
+            "description": "Target duration in minutes",
+            "maximum": 30.0,
+            "minimum": 1.0,
+            "title": "Duration Minutes",
+            "type": "integer"
+          },
+          "interviewer_profile": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SpeakerProfile"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Interviewer voice, tone, humor, and style"
+          },
+          "llm_profile_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": "default",
+            "description": "Server-defined safe LLM profile id",
+            "title": "Llm Profile Id"
+          },
+          "outline_preview_id": {
+            "anyOf": [
+              {
+                "maxLength": 80,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Opaque approved outline preview binding",
+            "title": "Outline Preview Id"
+          },
+          "sme_profile": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SpeakerProfile"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Subject matter expert guest voice, tone, humor, and expertise"
+          },
+          "topic": {
+            "description": "Podcast topic",
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Topic",
+            "type": "string"
+          },
+          "tts_profile_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": "default",
+            "description": "Server-defined safe TTS profile id",
+            "title": "Tts Profile Id"
+          },
+          "voice_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Voice ID from /api/v1/config voices list",
+            "title": "Voice Id"
+          }
+        },
+        "required": [
+          "topic",
+          "bpm"
+        ],
+        "title": "ProjectCreateRequest",
+        "type": "object"
+      },
+      "ProjectCreateResponse": {
+        "description": "Response for POST /api/v1/projects (202 Accepted).",
+        "properties": {
+          "manifest_url": {
+            "title": "Manifest Url",
+            "type": "string"
+          },
+          "project": {
+            "$ref": "#/components/schemas/PodcastProjectResponse"
+          }
+        },
+        "required": [
+          "project",
+          "manifest_url"
+        ],
+        "title": "ProjectCreateResponse",
+        "type": "object"
+      },
+      "ProjectDeleteResponse": {
+        "description": "Response for DELETE /api/v1/projects/{id}.",
+        "properties": {
+          "deleted_at": {
+            "title": "Deleted At",
+            "type": "string"
+          },
+          "project_id": {
+            "title": "Project Id",
+            "type": "string"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_id",
+          "status",
+          "deleted_at"
+        ],
+        "title": "ProjectDeleteResponse",
+        "type": "object"
+      },
+      "ProjectError": {
+        "properties": {
+          "code": {
+            "title": "Code",
+            "type": "string"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          },
+          "retryable": {
+            "default": false,
+            "title": "Retryable",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "title": "ProjectError",
+        "type": "object"
+      },
+      "ProjectListResponse": {
+        "description": "Response for GET /api/v1/projects.",
+        "properties": {
+          "projects": {
+            "items": {
+              "$ref": "#/components/schemas/ProjectSummary"
+            },
+            "title": "Projects",
+            "type": "array"
+          }
+        },
+        "required": [
+          "projects"
+        ],
+        "title": "ProjectListResponse",
+        "type": "object"
+      },
+      "ProjectOutlineResponse": {
+        "description": "Response for GET /api/v1/projects/{id}/outline.",
+        "properties": {
+          "project_id": {
+            "title": "Project Id",
+            "type": "string"
+          },
+          "sections": {
+            "items": {
+              "$ref": "#/components/schemas/OutlineSection"
+            },
+            "title": "Sections",
+            "type": "array"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          },
+          "topic": {
+            "title": "Topic",
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_id",
+          "topic",
+          "title"
+        ],
+        "title": "ProjectOutlineResponse",
+        "type": "object"
+      },
+      "ProjectSummary": {
+        "description": "Lightweight project entry for GET /api/v1/projects list.",
+        "properties": {
+          "bpm": {
+            "title": "Bpm",
+            "type": "integer"
+          },
+          "created_at": {
+            "title": "Created At",
+            "type": "string"
+          },
+          "duration_minutes": {
+            "title": "Duration Minutes",
+            "type": "integer"
+          },
+          "final_download_ready": {
+            "title": "Final Download Ready",
+            "type": "boolean"
+          },
+          "project_id": {
+            "title": "Project Id",
+            "type": "string"
+          },
+          "ready_segment_count": {
+            "title": "Ready Segment Count",
+            "type": "integer"
+          },
+          "revision_token": {
+            "title": "Revision Token",
+            "type": "string"
+          },
+          "segment_count": {
+            "title": "Segment Count",
+            "type": "integer"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "topic": {
+            "title": "Topic",
+            "type": "string"
+          },
+          "updated_at": {
+            "title": "Updated At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "project_id",
+          "topic",
+          "bpm",
+          "duration_minutes",
+          "status",
+          "revision_token",
+          "segment_count",
+          "ready_segment_count",
+          "final_download_ready",
+          "created_at",
+          "updated_at"
+        ],
+        "title": "ProjectSummary",
+        "type": "object"
+      },
+      "ProvenanceMetadata": {
+        "description": "Quality gate record for a segment.  Must be stored before TTS begins.",
+        "properties": {
+          "claim_notes": {
+            "description": "Notes for claims or rationale when sources are unavailable",
+            "items": {
+              "type": "string"
+            },
+            "title": "Claim Notes",
+            "type": "array"
+          },
+          "model": {
+            "const": "server-managed",
+            "default": "server-managed",
+            "description": "Fixed public sentinel; provider/model bindings are server-side",
+            "title": "Model",
+            "type": "string"
+          },
+          "prompt_id": {
+            "description": "Identifier for the generation prompt/template run",
+            "title": "Prompt Id",
+            "type": "string"
+          },
+          "source_refs": {
+            "description": "Source references when available",
+            "items": {
+              "type": "string"
+            },
+            "title": "Source Refs",
+            "type": "array"
+          },
+          "validated_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "ISO-8601 timestamp when validation completed",
+            "title": "Validated At"
+          },
+          "validation_errors": {
+            "description": "Empty when validation passes",
+            "items": {
+              "type": "string"
+            },
+            "title": "Validation Errors",
+            "type": "array"
+          },
+          "validation_status": {
+            "default": "pending",
+            "description": "Validation state",
+            "title": "Validation Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "prompt_id"
+        ],
+        "title": "ProvenanceMetadata",
+        "type": "object"
+      },
+      "ScriptRequest": {
+        "properties": {
+          "api_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Api Key"
+          },
+          "bpm": {
+            "maximum": 220.0,
+            "minimum": 60.0,
+            "title": "Bpm",
+            "type": "integer"
+          },
+          "duration_minutes": {
+            "default": 5,
+            "maximum": 30.0,
+            "minimum": 1.0,
+            "title": "Duration Minutes",
+            "type": "integer"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "openrouter_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Openrouter Key"
+          },
+          "provider": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Provider"
+          },
+          "topic": {
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Topic",
+            "type": "string"
+          }
+        },
+        "required": [
+          "topic",
+          "bpm"
+        ],
+        "title": "ScriptRequest",
+        "type": "object"
+      },
+      "ScriptStoreRequest": {
+        "description": "Request to generate and store a script.",
+        "properties": {
+          "api_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Api Key"
+          },
+          "bpm": {
+            "maximum": 220.0,
+            "minimum": 60.0,
+            "title": "Bpm",
+            "type": "integer"
+          },
+          "duration_minutes": {
+            "default": 5,
+            "maximum": 30.0,
+            "minimum": 1.0,
+            "title": "Duration Minutes",
+            "type": "integer"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "openrouter_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Openrouter Key"
+          },
+          "provider": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Provider"
+          },
+          "topic": {
+            "maxLength": 200,
+            "minLength": 1,
+            "title": "Topic",
+            "type": "string"
+          }
+        },
+        "required": [
+          "topic",
+          "bpm"
+        ],
+        "title": "ScriptStoreRequest",
+        "type": "object"
+      },
+      "Segment": {
+        "description": "Sub-topic-level generation and playback unit.",
+        "properties": {
+          "artifact_ids": {
+            "description": "Canonical artifacts produced for this segment",
+            "items": {
+              "type": "string"
+            },
+            "title": "Artifact Ids",
+            "type": "array"
+          },
+          "created_at": {
+            "title": "Created At",
+            "type": "string"
+          },
+          "duration_seconds": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Known after audio artifact creation",
+            "title": "Duration Seconds"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SegmentError"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Segment-level failure details"
+          },
+          "index": {
+            "description": "Playback order within the project",
+            "title": "Index",
+            "type": "integer"
+          },
+          "primary_audio_artifact_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Main playable audio artifact when ready",
+            "title": "Primary Audio Artifact Id"
+          },
+          "provenance": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ProvenanceMetadata"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Required before tts/mixing/ready"
+          },
+          "segment_id": {
+            "description": "Stable segment identifier",
+            "title": "Segment Id",
+            "type": "string"
+          },
+          "status": {
+            "default": "queued",
+            "description": "Segment lifecycle status",
+            "title": "Status",
+            "type": "string"
+          },
+          "subtopic": {
+            "description": "Segment topic derived from project outline",
+            "title": "Subtopic",
+            "type": "string"
+          },
+          "text": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Generated segment script text",
+            "title": "Text"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "User-facing segment title",
+            "title": "Title"
+          },
+          "updated_at": {
+            "title": "Updated At",
+            "type": "string"
+          }
+        },
+        "required": [
+          "segment_id",
+          "index",
+          "subtopic"
+        ],
+        "title": "Segment",
+        "type": "object"
+      },
+      "SegmentError": {
+        "properties": {
+          "code": {
+            "description": "Machine-readable error code",
+            "title": "Code",
+            "type": "string"
+          },
+          "message": {
+            "description": "Human-readable error detail",
+            "title": "Message",
+            "type": "string"
+          },
+          "retryable": {
+            "default": false,
+            "description": "Whether this error is retryable",
+            "title": "Retryable",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "title": "SegmentError",
+        "type": "object"
+      },
+      "SpeakerProfile": {
+        "description": "Dialogue speaker profile used by script generation prompts.",
+        "properties": {
+          "expertise": {
+            "anyOf": [
+              {
+                "maxLength": 160,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "SME expertise framing",
+            "title": "Expertise"
+          },
+          "humor": {
+            "anyOf": [
+              {
+                "maxLength": 120,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Humor level/style",
+            "title": "Humor"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "maxLength": 80,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Display name or role label",
+            "title": "Name"
+          },
+          "style": {
+            "anyOf": [
+              {
+                "maxLength": 160,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Interviewing or expertise style",
+            "title": "Style"
+          },
+          "tone": {
+            "anyOf": [
+              {
+                "maxLength": 120,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Speaking tone",
+            "title": "Tone"
+          },
+          "voice": {
+            "anyOf": [
+              {
+                "maxLength": 120,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Legacy display-only voice description",
+            "title": "Voice"
+          },
+          "voice_id": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Opaque voice ID from /api/v1/config",
+            "title": "Voice Id"
+          }
+        },
+        "title": "SpeakerProfile",
+        "type": "object"
+      },
+      "SpeechRequest": {
+        "description": "Request for TTS-only generation (no beat, no mix).",
+        "properties": {
+          "api_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Api Key"
+          },
+          "openrouter_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Openrouter Key"
+          },
+          "speech_text": {
+            "maxLength": 20000,
+            "minLength": 1,
+            "title": "Speech Text",
+            "type": "string"
+          },
+          "tts_model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tts Model"
+          },
+          "tts_provider": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tts Provider"
+          },
+          "voice": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Voice"
+          }
+        },
+        "required": [
+          "speech_text"
+        ],
+        "title": "SpeechRequest",
+        "type": "object"
+      },
+      "SummaryRequest": {
+        "description": "Request to generate a summary for an existing script.",
+        "properties": {
+          "api_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Api Key"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "openrouter_key": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Openrouter Key"
+          },
+          "provider": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Provider"
+          }
+        },
+        "title": "SummaryRequest",
+        "type": "object"
+      },
+      "TTSProfileSummary": {
+        "properties": {
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "id": {
+            "pattern": "^[a-z0-9][a-z0-9-]{0,63}$",
+            "title": "Id",
+            "type": "string"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "label"
+        ],
+        "title": "TTSProfileSummary",
+        "type": "object"
+      },
+      "TransferUrlResponse": {
+        "description": "Response for POST /api/v1/artifacts/{id}/transfer-url.",
+        "properties": {
+          "artifact_id": {
+            "title": "Artifact Id",
+            "type": "string"
+          },
+          "signed_transfer_expires_at": {
+            "title": "Signed Transfer Expires At",
+            "type": "string"
+          },
+          "signed_transfer_url": {
+            "title": "Signed Transfer Url",
+            "type": "string"
+          }
+        },
+        "required": [
+          "artifact_id",
+          "signed_transfer_url",
+          "signed_transfer_expires_at"
+        ],
+        "title": "TransferUrlResponse",
+        "type": "object"
+      },
+      "ValidationError": {
+        "properties": {
+          "ctx": {
+            "title": "Context",
+            "type": "object"
+          },
+          "input": {
+            "title": "Input"
+          },
+          "loc": {
+            "items": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "integer"
+                }
+              ]
+            },
+            "title": "Location",
+            "type": "array"
+          },
+          "msg": {
+            "title": "Message",
+            "type": "string"
+          },
+          "type": {
+            "title": "Error Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "loc",
+          "msg",
+          "type"
+        ],
+        "title": "ValidationError",
+        "type": "object"
+      },
+      "VoiceProfile": {
+        "properties": {
+          "id": {
+            "pattern": "^[a-z0-9][a-z0-9-]{0,63}$",
+            "title": "Id",
+            "type": "string"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          },
+          "roles": {
+            "items": {
+              "enum": [
+                "interviewer",
+                "guest"
+              ],
+              "type": "string"
+            },
+            "title": "Roles",
+            "type": "array"
+          }
+        },
+        "required": [
+          "id",
+          "label"
+        ],
+        "title": "VoiceProfile",
+        "type": "object"
+      },
+      "podcast_worker__core__models__HealthResponse": {
+        "properties": {
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "uptime": {
+            "title": "Uptime",
+            "type": "number"
+          },
+          "version": {
+            "title": "Version",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "version",
+          "uptime"
+        ],
+        "title": "HealthResponse",
+        "type": "object"
+      },
+      "podcast_worker__core__models_v1__HealthResponse": {
+        "description": "GET /api/v1/health.",
+        "properties": {
+          "status": {
+            "title": "Status",
+            "type": "string"
+          },
+          "uptime_seconds": {
+            "title": "Uptime Seconds",
+            "type": "number"
+          },
+          "version": {
+            "title": "Version",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "version",
+          "uptime_seconds"
+        ],
+        "title": "HealthResponse",
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "description": "Heavy-lift service for script generation, TTS, beat generation, and audio mixing.",
+    "title": "Straub AH \u2014 Podcast Worker Service",
+    "version": "2.0.0"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/api/services/config": {
+      "get": {
+        "description": "Return available providers, voices, models, and constraints.",
+        "operationId": "get_config_api_services_config_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Get Config",
+        "tags": [
+          "health"
+        ]
+      }
+    },
+    "/api/services/generate": {
+      "post": {
+        "description": "Start full podcast generation asynchronously. Returns job_id for polling.",
+        "operationId": "generate_podcast_api_services_generate_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "Authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/GenerateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Generate Podcast",
+        "tags": [
+          "jobs"
+        ]
+      }
+    },
+    "/api/services/generate-audio": {
+      "post": {
+        "description": "Generate audio from text: TTS + beat + mix. Returns paths synchronously.",
+        "operationId": "generate_audio_endpoint_api_services_generate_audio_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "Authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AudioRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Generate Audio Endpoint",
+        "tags": [
+          "audio"
+        ]
+      }
+    },
+    "/api/services/generate-beat": {
+      "post": {
+        "description": "Generate a beat only. Returns the WAV file synchronously.",
+        "operationId": "generate_beat_endpoint_api_services_generate_beat_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "Authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BeatRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Generate Beat Endpoint",
+        "tags": [
+          "audio"
+        ]
+      }
+    },
+    "/api/services/generate-outline": {
+      "post": {
+        "description": "Generate only the script outline synchronously.",
+        "operationId": "generate_outline_endpoint_api_services_generate_outline_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "Authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ScriptRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Generate Outline Endpoint",
+        "tags": [
+          "scripts"
+        ]
+      }
+    },
+    "/api/services/generate-script": {
+      "post": {
+        "description": "Generate a podcast script only. Returns the script JSON synchronously.",
+        "operationId": "generate_script_endpoint_api_services_generate_script_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "Authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ScriptRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Generate Script Endpoint",
+        "tags": [
+          "scripts"
+        ]
+      }
+    },
+    "/api/services/generate-speech": {
+      "post": {
+        "description": "Generate speech audio from text (TTS only \u2014 no beat, no mix).",
+        "operationId": "generate_speech_endpoint_api_services_generate_speech_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "Authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SpeechRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Generate Speech Endpoint",
+        "tags": [
+          "audio"
+        ]
+      }
+    },
+    "/api/services/health": {
+      "get": {
+        "description": "Health check endpoint.",
+        "operationId": "health_api_services_health_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/podcast_worker__core__models__HealthResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Health",
+        "tags": [
+          "health"
+        ]
+      }
+    },
+    "/api/services/jobs/{job_id}": {
+      "get": {
+        "description": "Poll job status. Returns status, progress, error, and result if completed.",
+        "operationId": "get_job_status_api_services_jobs__job_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "title": "Job Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Job Status",
+        "tags": [
+          "jobs"
+        ]
+      }
+    },
+    "/api/services/jobs/{job_id}/result": {
+      "get": {
+        "description": "Download the final podcast audio file.",
+        "operationId": "download_result_api_services_jobs__job_id__result_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "title": "Job Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Download Result",
+        "tags": [
+          "jobs"
+        ]
+      }
+    },
+    "/api/services/jobs/{job_id}/script": {
+      "get": {
+        "description": "Download the script JSON for a completed job.",
+        "operationId": "download_script_api_services_jobs__job_id__script_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "job_id",
+            "required": true,
+            "schema": {
+              "title": "Job Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Download Script",
+        "tags": [
+          "jobs"
+        ]
+      }
+    },
+    "/api/services/overlay-audio": {
+      "post": {
+        "description": "Overlay pre-generated speech and beat WAVs into a finished podcast.\n\nAccepts two WAV files as multipart upload with BPM/duration form fields.\nReturns the mixed podcast with intro/outro, ducking, and MP3 conversion.",
+        "operationId": "overlay_audio_endpoint_api_services_overlay_audio_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "Authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_overlay_audio_endpoint_api_services_overlay_audio_post"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Overlay Audio Endpoint",
+        "tags": [
+          "audio"
+        ]
+      }
+    },
+    "/api/services/scripts": {
+      "get": {
+        "description": "List all stored scripts with metadata (no full script content).",
+        "operationId": "list_scripts_api_services_scripts_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "Authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Scripts",
+        "tags": [
+          "scripts"
+        ]
+      },
+      "post": {
+        "description": "Generate a podcast script, store it, and return a script_id.",
+        "operationId": "create_script_api_services_scripts_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "Authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ScriptStoreRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Script",
+        "tags": [
+          "scripts"
+        ]
+      }
+    },
+    "/api/services/scripts/{script_id}": {
+      "get": {
+        "description": "Retrieve a stored script by its script_id. Returns full script content.",
+        "operationId": "get_script_api_services_scripts__script_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "script_id",
+            "required": true,
+            "schema": {
+              "title": "Script Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Script",
+        "tags": [
+          "scripts"
+        ]
+      }
+    },
+    "/api/services/scripts/{script_id}/follow-up": {
+      "post": {
+        "description": "Generate follow-up questions for a stored script.",
+        "operationId": "generate_follow_up_api_services_scripts__script_id__follow_up_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "script_id",
+            "required": true,
+            "schema": {
+              "title": "Script Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/FollowUpRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Generate Follow Up",
+        "tags": [
+          "scripts"
+        ]
+      }
+    },
+    "/api/services/scripts/{script_id}/outline": {
+      "get": {
+        "description": "Retrieve the outline for a stored script without full script text.",
+        "operationId": "get_script_outline_api_services_scripts__script_id__outline_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "script_id",
+            "required": true,
+            "schema": {
+              "title": "Script Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Script Outline",
+        "tags": [
+          "scripts"
+        ]
+      }
+    },
+    "/api/services/scripts/{script_id}/summary": {
+      "post": {
+        "description": "Generate a summary for a stored script.",
+        "operationId": "generate_summary_api_services_scripts__script_id__summary_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "script_id",
+            "required": true,
+            "schema": {
+              "title": "Script Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SummaryRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Generate Summary",
+        "tags": [
+          "scripts"
+        ]
+      }
+    },
+    "/api/v1/artifacts/{artifact_id}": {
+      "get": {
+        "description": "Stream or download an artifact for the authenticated owner.",
+        "operationId": "download_artifact_api_v1_artifacts__artifact_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "artifact_id",
+            "required": true,
+            "schema": {
+              "title": "Artifact Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Download Artifact",
+        "tags": [
+          "v1-artifacts"
+        ]
+      }
+    },
+    "/api/v1/artifacts/{artifact_id}/transfer-url": {
+      "post": {
+        "description": "Refresh a short-lived signed media transfer URL.\n\nIn v1 with local file storage, signed URLs are identity \u2014 we return the\nauthenticated download URL as the transfer URL.  When object storage\noffload is added, this endpoint will generate real signed URLs.",
+        "operationId": "refresh_transfer_url_api_v1_artifacts__artifact_id__transfer_url_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "artifact_id",
+            "required": true,
+            "schema": {
+              "title": "Artifact Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TransferUrlResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Refresh Transfer Url",
+        "tags": [
+          "v1-artifacts"
+        ]
+      }
+    },
+    "/api/v1/config": {
+      "get": {
+        "description": "Return authenticated safe summaries derived from server-owned profile configuration.",
+        "operationId": "get_config_api_v1_config_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "Authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConfigResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Config",
+        "tags": [
+          "v1-health"
+        ]
+      }
+    },
+    "/api/v1/health": {
+      "get": {
+        "description": "Service health check. Auth is optional for deployment probes.",
+        "operationId": "health_api_v1_health_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/podcast_worker__core__models_v1__HealthResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Health",
+        "tags": [
+          "v1-health"
+        ]
+      }
+    },
+    "/api/v1/projects": {
+      "get": {
+        "description": "List durable project manifests for the authenticated owner.",
+        "operationId": "list_projects_api_v1_projects_get",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "Authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectListResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Projects",
+        "tags": [
+          "v1-projects"
+        ]
+      },
+      "post": {
+        "description": "Create a durable PodcastProject and start backend generation.",
+        "operationId": "create_project_api_v1_projects_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "Authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ProjectCreateRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectCreateResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Project",
+        "tags": [
+          "v1-projects"
+        ]
+      }
+    },
+    "/api/v1/projects/outline-preview": {
+      "post": {
+        "description": "Generate a reviewable outline with a durable paired safe-profile binding.",
+        "operationId": "preview_project_outline_api_v1_projects_outline_preview_post",
+        "parameters": [
+          {
+            "in": "header",
+            "name": "Authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OutlinePreviewRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OutlinePreviewResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Preview Project Outline",
+        "tags": [
+          "v1-projects"
+        ]
+      }
+    },
+    "/api/v1/projects/{project_id}": {
+      "delete": {
+        "description": "Delete the project and its retained artifacts.",
+        "operationId": "delete_project_api_v1_projects__project_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectDeleteResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Delete Project",
+        "tags": [
+          "v1-projects"
+        ]
+      },
+      "get": {
+        "description": "Return the canonical backend-owned PodcastProject manifest.",
+        "operationId": "get_project_api_v1_projects__project_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PodcastProjectResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Project",
+        "tags": [
+          "v1-projects"
+        ]
+      }
+    },
+    "/api/v1/projects/{project_id}/outline": {
+      "get": {
+        "description": "Return the project's script outline without full segment text or artifacts.",
+        "operationId": "get_project_outline_api_v1_projects__project_id__outline_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project_id",
+            "required": true,
+            "schema": {
+              "title": "Project Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Authorization",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Authorization"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProjectOutlineResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Project Outline",
+        "tags": [
+          "v1-projects"
+        ]
+      }
+    }
+  }
+}

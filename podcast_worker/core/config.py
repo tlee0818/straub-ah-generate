@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Literal, Mapping
@@ -25,6 +25,33 @@ V1_LLM_PURPOSES = LLM_PURPOSES[:5]
 
 class RoutingConfigurationError(ValueError):
     """Raised before provider work when an operator routing configuration is invalid."""
+@dataclass(frozen=True)
+class BudgetPolicy:
+    mode: Literal["off", "enforced"] = "off"
+    currency: str | None = None
+    caps: Mapping[str, int] = field(default_factory=dict)
+    pricing: Mapping[str, int] = field(default_factory=dict)
+
+
+def _budget_policy(raw: Any) -> BudgetPolicy:
+    if raw is None:
+        return BudgetPolicy()
+    if not isinstance(raw, Mapping):
+        raise RoutingConfigurationError("invalid_profile_budget")
+    mode = raw.get("mode", "off")
+    currency, caps, pricing = raw.get("currency"), raw.get("caps", {}), raw.get("pricing", {})
+    if mode not in {"off", "enforced"} or not isinstance(caps, Mapping) or not isinstance(pricing, Mapping):
+        raise RoutingConfigurationError("invalid_profile_budget")
+    if mode == "enforced" and (not isinstance(currency, str) or not currency):
+        raise RoutingConfigurationError("invalid_profile_budget")
+    if mode == "off" and (currency is not None or caps or pricing):
+        raise RoutingConfigurationError("invalid_profile_budget")
+    if set(caps) - {"llm", "tts"} or set(pricing) - {"llm", "tts"}:
+        raise RoutingConfigurationError("invalid_profile_budget")
+    for value in (*caps.values(), *pricing.values()):
+        if not isinstance(value, int) or isinstance(value, bool) or value < 0:
+            raise RoutingConfigurationError("invalid_profile_budget")
+    return BudgetPolicy(mode, currency, MappingProxyType(dict(caps)), MappingProxyType(dict(pricing)))
 
 
 @dataclass(frozen=True)
@@ -42,6 +69,7 @@ class ResolvedExecutionSnapshot:
     profile_id: str
     revision: str
     routes: Mapping[str, LLMRoute]
+    budget: BudgetPolicy = field(default_factory=BudgetPolicy)
 
     def route_for(self, purpose: str) -> LLMRoute:
         try:
@@ -53,6 +81,7 @@ class ResolvedExecutionSnapshot:
         payload = {
             "profile_id": self.profile_id,
             "routes": {name: asdict(self.routes[name]) for name in sorted(self.routes)},
+            "budget": {"mode": self.budget.mode, "currency": self.budget.currency, "caps": dict(self.budget.caps), "pricing": dict(self.budget.pricing)},
         }
         return json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
@@ -74,6 +103,7 @@ class ResolvedTTSSnapshot:
     context_max_age_seconds: int = 0
     continuity_after_expiry: str | None = None
     max_concurrent_requests: int = 1
+    budget: BudgetPolicy = field(default_factory=BudgetPolicy)
 def execution_snapshot_from_payload(payload: Mapping[str, Any], revision: str | None = None) -> ResolvedExecutionSnapshot:
     """Hydrate the persisted server-only LLM snapshot without consulting Settings."""
     profile_id, routes_payload = payload.get("profile_id"), payload.get("routes")
@@ -92,7 +122,7 @@ def execution_snapshot_from_payload(payload: Mapping[str, Any], revision: str | 
     resolved_revision = revision or payload.get("revision")
     if not isinstance(resolved_revision, str) or not resolved_revision:
         raise RoutingConfigurationError("invalid_persisted_llm_snapshot")
-    return ResolvedExecutionSnapshot(profile_id, resolved_revision, MappingProxyType(routes))
+    return ResolvedExecutionSnapshot(profile_id, resolved_revision, MappingProxyType(routes), _budget_policy(payload.get("budget")))
 
 
 def tts_snapshot_from_payload(payload: Mapping[str, Any], revision: str | None = None) -> ResolvedTTSSnapshot:
@@ -113,6 +143,7 @@ def tts_snapshot_from_payload(payload: Mapping[str, Any], revision: str | None =
         MappingProxyType(dict(bindings)), int(payload["max_attempts"]),
         int(payload.get("context_max_request_ids", 0)), int(payload.get("context_max_age_seconds", 0)),
         payload.get("continuity_after_expiry"), int(payload.get("max_concurrent_requests", 1)),
+        _budget_policy(payload.get("budget")),
     )
 
 
@@ -228,8 +259,9 @@ def resolve_llm_profile(profile_id: str | None = None) -> ResolvedExecutionSnaps
         routes[purpose] = LLMRoute(purpose, provider, model, dialect, float(raw.get("temperature", 0.8)), int(raw.get("timeout_seconds", 120)))
     # Legacy endpoints intentionally retain scalar server-only routing.
     routes.update({purpose: _scalar_llm_route(purpose) for purpose in LLM_PURPOSES[5:]})
-    payload = {name: asdict(route) for name, route in routes.items()}
-    return ResolvedExecutionSnapshot(str(selected), _revision("rte", payload), MappingProxyType(routes))
+    budget = _budget_policy(profile.get("budget"))
+    payload = {"routes": {name: asdict(route) for name, route in routes.items()}, "budget": {"mode": budget.mode, "currency": budget.currency, "caps": dict(budget.caps), "pricing": dict(budget.pricing)}}
+    return ResolvedExecutionSnapshot(str(selected), _revision("rte", payload), MappingProxyType(routes), budget)
 
 
 def resolve_tts_profile(profile_id: str | None = None, interviewer_voice_id: str | None = None, guest_voice_id: str | None = None) -> ResolvedTTSSnapshot:
@@ -261,13 +293,14 @@ def resolve_tts_profile(profile_id: str | None = None, interviewer_voice_id: str
         raise RoutingConfigurationError("invalid_v3_tts_profile")
     if strategy == "stitched_text_to_speech" and (model_id == "eleven_v3" or max_fragment_characters < 1 or max_scene_characters != 0 or max_scene_turns != 0):
         raise RoutingConfigurationError("invalid_stitched_tts_profile")
-    snapshot_payload = {"profile": profile, "bindings": bindings}
-    return ResolvedTTSSnapshot(str(selected), _revision("tts", snapshot_payload), "elevenlabs", strategy, model_id, str(profile.get("output_format", "mp3")), max_scene_characters, max_scene_turns, max_fragment_characters, MappingProxyType(bindings), int(profile.get("max_attempts", 1)), int(profile.get("context_max_request_ids", 0)), int(profile.get("context_max_age_seconds", 0)), profile.get("continuity_after_expiry"), int(profile.get("max_concurrent_requests", 1)))
+    budget = _budget_policy(profile.get("budget"))
+    snapshot_payload = {"profile": profile, "bindings": bindings, "budget": {"mode": budget.mode, "currency": budget.currency, "caps": dict(budget.caps), "pricing": dict(budget.pricing)}}
+    return ResolvedTTSSnapshot(str(selected), _revision("tts", snapshot_payload), "elevenlabs", strategy, model_id, str(profile.get("output_format", "mp3")), max_scene_characters, max_scene_turns, max_fragment_characters, MappingProxyType(bindings), int(profile.get("max_attempts", 1)), int(profile.get("context_max_request_ids", 0)), int(profile.get("context_max_age_seconds", 0)), profile.get("continuity_after_expiry"), int(profile.get("max_concurrent_requests", 1)), budget)
 
 
 def validate_profile_pair(llm: ResolvedExecutionSnapshot, tts: ResolvedTTSSnapshot) -> None:
-    """Compatibility hook for persistence/API lanes; budget validation remains server-side."""
-    if not llm.revision or not tts.revision:
+    """Profiles must agree on one typed ledger policy before any provider call."""
+    if not llm.revision or not tts.revision or llm.budget != tts.budget:
         raise RoutingConfigurationError("incompatible_generation_profiles")
 
 

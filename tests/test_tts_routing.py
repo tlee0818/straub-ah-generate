@@ -85,6 +85,15 @@ class TestElevenLabsPlanning:
         ]
         assert all(len(plan.turns[0].text) <= 12 for plan in plans)
         assert [plan.plan_id for plan in plans] == [f"fragment-{index}" for index in range(4)]
+    def test_persisted_plan_namespace_prevents_cross_segment_collisions(self):
+        snapshot = _snapshot("text_to_dialogue_v3")
+        first = plan_dialogue_requests("Interviewer: Hello.", snapshot, namespace="project-a:segment-a")
+        second = plan_dialogue_requests("Interviewer: Hello.", snapshot, namespace="project-b:segment-b")
+
+        assert [plan.plan_id for plan in first] == ["project-a:segment-a:scene-0"]
+        assert [plan.plan_id for plan in second] == ["project-b:segment-b:scene-0"]
+        assert first[0].plan_id != second[0].plan_id
+
 
     def test_oversized_v3_turn_is_rejected_before_provider_dispatch(self):
         with pytest.raises(RoutingConfigurationError, match="tts_turn_too_long"):
@@ -121,6 +130,7 @@ class TestElevenLabsExecution:
             {"text": "Hello.", "voice_id": "eleven-host"},
             {"text": "Welcome.", "voice_id": "eleven-guest"},
         ]
+        assert calls[0][1]["headers"]["X-Request-Id"] == plan.plan_id
 
     def test_ambiguous_provider_outcome_is_not_blindly_retried(self, monkeypatch, tmp_path):
         from podcast_worker.core import tts_engine
@@ -139,3 +149,12 @@ class TestElevenLabsExecution:
             synthesize_elevenlabs_plan(plan, _snapshot("text_to_dialogue_v3"), str(tmp_path / "scene.mp3"))
         assert len(calls) == 1
         assert classify_tts_failure(None, dispatched=True) == "unknown_outcome"
+    @pytest.mark.parametrize(
+        ("status_code", "outcome"),
+        [(429, "retryable"), (500, "retryable"), (503, "retryable"), (400, "terminal")],
+    )
+    def test_only_proven_provider_rejections_are_classified_for_safe_retry(self, status_code, outcome):
+        assert classify_tts_failure(status_code, dispatched=True) == outcome
+
+    def test_pre_send_failure_is_not_misclassified_as_a_provider_rejection(self):
+        assert classify_tts_failure(None, dispatched=False) == "pre_send"

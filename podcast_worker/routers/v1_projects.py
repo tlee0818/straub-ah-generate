@@ -80,6 +80,8 @@ def _tts_snapshot_payload(snapshot) -> dict:
         "context_max_age_seconds": snapshot.context_max_age_seconds,
         "continuity_after_expiry": snapshot.continuity_after_expiry,
         "max_concurrent_requests": snapshot.max_concurrent_requests,
+        "budget": {"mode": snapshot.budget.mode, "currency": snapshot.budget.currency,
+                   "caps": dict(snapshot.budget.caps), "pricing": dict(snapshot.budget.pricing)},
     }
 
 def _short_id(prefix: str) -> str:
@@ -172,36 +174,46 @@ async def preview_project_outline(
     except RoutingConfigurationError as exc:
         raise _routing_error(exc, str(exc) == "incompatible_generation_profiles") from exc
     llm_profile_id, tts_profile_id = llm.profile_id, tts.profile_id
-    outline = generate_script_outline(
-        topic=req.topic,
-        bpm=req.bpm,
-        duration_minutes=req.duration_minutes,
-        snapshot=llm,
-    )
-    response = _outline_response_from_generator(req.topic, outline)
-    preview_id = _short_id("opv")
+    preview_id, ledger_id, attempt_id = _short_id("opv"), _short_id("led"), _short_id("att")
     routing_revision, tts_routing_revision = llm.revision, tts.revision
     llm_payload, tts_payload = _llm_snapshot_payload(llm), _tts_snapshot_payload(tts)
-    llm_snapshot = {"snapshot_id": _short_id("lsn"), "profile_id": llm_profile_id,
-                    "revision": routing_revision, "payload": llm_payload,
-                    "sha256": hashlib.sha256(json.dumps(llm_payload, sort_keys=True).encode()).hexdigest()}
-    tts_snapshot = {"snapshot_id": _short_id("tsn"), "profile_id": tts_profile_id,
-                    "revision": tts_routing_revision, "payload": tts_payload,
-                    "sha256": hashlib.sha256(json.dumps(tts_payload, sort_keys=True).encode()).hexdigest()}
+    llm_snapshot = {"snapshot_id": _short_id("lsn"), "profile_id": llm_profile_id, "revision": routing_revision,
+                    "payload": llm_payload, "sha256": hashlib.sha256(json.dumps(llm_payload, sort_keys=True).encode()).hexdigest()}
+    tts_snapshot = {"snapshot_id": _short_id("tsn"), "profile_id": tts_profile_id, "revision": tts_routing_revision,
+                    "payload": tts_payload, "sha256": hashlib.sha256(json.dumps(tts_payload, sort_keys=True).encode()).hexdigest()}
     expires_at = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+    policy = {"mode": llm.budget.mode, "caps": dict(llm.budget.caps), "pricing": dict(llm.budget.pricing)}
     await persistence.create_preview_binding(_db_path(), {
         "outline_preview_id": preview_id, "owner_id": owner_id, "topic": req.topic, "bpm": req.bpm,
-        "duration_minutes": req.duration_minutes, "outline": response.model_dump(),
-        "llm_profile_id": llm_profile_id, "tts_profile_id": tts_profile_id,
-        "routing_revision": routing_revision, "tts_routing_revision": tts_routing_revision,
-        "expires_at": expires_at,
-    }, llm_snapshot, tts_snapshot, {
-        "ledger_id": _short_id("led"), "policy": {"enforcement": "off"}, "currency": None,
+        "duration_minutes": req.duration_minutes, "outline": {}, "llm_profile_id": llm_profile_id,
+        "tts_profile_id": tts_profile_id, "routing_revision": routing_revision,
+        "tts_routing_revision": tts_routing_revision, "expires_at": expires_at,
+    }, llm_snapshot, tts_snapshot, {"ledger_id": ledger_id, "policy": policy, "currency": llm.budget.currency})
+    reservation = {"entry_id": _short_id("ledent"), "ledger_id": ledger_id, "category": "llm",
+                   "operation_type": "outline", "correlation_id": preview_id, "resource_unit": "request",
+                   "amount": 1, "pricing": dict(llm.budget.pricing)}
+    accepted = await persistence.reserve_ledger_operation(_db_path(), reservation, {
+        "attempt_id": attempt_id, "snapshot_revision": routing_revision,
+        "binding": {"purpose": "outline", "provider": llm.route_for("outline").provider, "model": llm.route_for("outline").model},
     })
+    if not accepted:
+        raise HTTPException(status_code=409, detail=ErrorEnvelope(error=ErrorResponse(
+            code="generation_budget_exhausted", message="Generation budget is unavailable."
+        )).model_dump())
+    try:
+        outline = generate_script_outline(topic=req.topic, bpm=req.bpm, duration_minutes=req.duration_minutes, snapshot=llm)
+    except Exception as exc:
+        await persistence.settle_ledger_operation(_db_path(), ledger_id, attempt_id, {**reservation, "entry_id": _short_id("ledent")},
+                                                  "failed", error={"code": "outline_failed"})
+        raise
+    response = _outline_response_from_generator(req.topic, outline)
+    await persistence.update_preview_outline(_db_path(), preview_id, response.model_dump())
+    await persistence.settle_ledger_operation(_db_path(), ledger_id, attempt_id, {**reservation, "entry_id": _short_id("ledent")},
+                                              "succeeded")
     return OutlinePreviewResponse(**response.model_dump(), outline_preview_id=preview_id,
                                   llm_profile_id=llm_profile_id, tts_profile_id=tts_profile_id,
-                                  routing_revision=routing_revision,
-                                  tts_routing_revision=tts_routing_revision, expires_at=expires_at)
+                                  routing_revision=routing_revision, tts_routing_revision=tts_routing_revision,
+                                  expires_at=expires_at)
 
 
 
@@ -233,11 +245,12 @@ async def create_project(
             raise HTTPException(status_code=409, detail=ErrorEnvelope(error=ErrorResponse(
                 code="preview_binding_required", message="This outline preview must be regenerated."
             )).model_dump())
-        if (preview["llm_profile_id"], preview["tts_profile_id"], preview["routing_revision"],
-            preview["tts_routing_revision"]) != (llm_profile_id, tts_profile_id,
-                                                  routing_revision, tts_routing_revision):
+        if (preview["topic"], preview["bpm"], preview["duration_minutes"], preview["llm_profile_id"],
+            preview["tts_profile_id"], preview["routing_revision"], preview["tts_routing_revision"]) != (
+                req.topic, req.bpm, req.duration_minutes, llm_profile_id, tts_profile_id,
+                routing_revision, tts_routing_revision):
             raise HTTPException(status_code=409, detail=ErrorEnvelope(error=ErrorResponse(
-                code="preview_profile_mismatch", message="The selected generation profile differs from the preview."
+                code="preview_profile_mismatch", message="The selected generation request differs from the preview."
             )).model_dump())
     project_id = _short_id("prj")
     db = _db_path()
@@ -246,8 +259,8 @@ async def create_project(
     project = await persistence.create_project(db, project_id, owner_id, req.topic, req.bpm, req.duration_minutes)
     if preview:
         result = await persistence.consume_preview_binding(
-            db, req.outline_preview_id, owner_id, project_id, llm_profile_id, tts_profile_id,
-            routing_revision, tts_routing_revision,
+            db, req.outline_preview_id, owner_id, project_id, req.topic, req.bpm, req.duration_minutes,
+            llm_profile_id, tts_profile_id, routing_revision, tts_routing_revision,
         )
         if result != "ok":
             await persistence.delete_project(db, project_id)
@@ -267,7 +280,9 @@ async def create_project(
                         "sha256": hashlib.sha256(json.dumps(tts_payload, sort_keys=True).encode()).hexdigest()}
         ledger_id = _short_id("led")
         await persistence.create_project_execution(db, project_id, owner_id, llm_snapshot, tts_snapshot, {
-            "ledger_id": ledger_id, "policy": {"enforcement": "off"}, "currency": None,
+            "ledger_id": ledger_id,
+            "policy": {"mode": llm.budget.mode, "caps": dict(llm.budget.caps), "pricing": dict(llm.budget.pricing)},
+            "currency": llm.budget.currency,
         })
     await persistence.upsert_durable_record(db, "work_items", {
         "work_id": _short_id("wrk"), "project_id": project_id, "ledger_id": ledger_id,
@@ -275,6 +290,10 @@ async def create_project(
         "payload_json": {"llm_profile_id": llm_profile_id, "tts_profile_id": tts_profile_id,
                          "routing_revision": routing_revision, "tts_routing_revision": tts_routing_revision},
     })
+    await persistence.claim_reconcilable_work(
+        db, "work_items", f"request:{project_id}",
+        (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat(),
+    )
 
     # Start background segment generation in a daemon thread
     outline = _outline_response_to_generator(req.approved_outline)

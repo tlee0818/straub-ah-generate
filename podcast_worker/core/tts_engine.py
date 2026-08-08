@@ -85,9 +85,12 @@ def parse_dialogue_turns(text: str) -> tuple[DialogueTurn, ...]:
     return tuple(turns)
 
 
-def plan_dialogue_requests(text: str, snapshot: ResolvedTTSSnapshot) -> tuple[TTSRequestPlan, ...]:
-    """Create deterministic, strategy-specific request boundaries from an immutable snapshot."""
+def plan_dialogue_requests(
+    text: str, snapshot: ResolvedTTSSnapshot, namespace: str = ""
+) -> tuple[TTSRequestPlan, ...]:
+    """Create deterministic request boundaries, uniquely scoped when persisted."""
     turns = parse_dialogue_turns(text)
+    prefix = f"{namespace}:" if namespace else ""
     if snapshot.strategy == "text_to_dialogue_v3":
         plans: list[TTSRequestPlan] = []
         current: list[DialogueTurn] = []
@@ -97,19 +100,19 @@ def plan_dialogue_requests(text: str, snapshot: ResolvedTTSSnapshot) -> tuple[TT
                 raise RoutingConfigurationError("tts_turn_too_long")
             exceeds = current and (len(current) >= snapshot.max_scene_turns or char_count + len(turn.text) > snapshot.max_scene_characters)
             if exceeds:
-                plans.append(TTSRequestPlan(f"scene-{len(plans)}", snapshot.strategy, tuple(current)))
+                plans.append(TTSRequestPlan(f"{prefix}scene-{len(plans)}", snapshot.strategy, tuple(current)))
                 current, char_count = [], 0
             current.append(turn)
             char_count += len(turn.text)
         if current:
-            plans.append(TTSRequestPlan(f"scene-{len(plans)}", snapshot.strategy, tuple(current)))
+            plans.append(TTSRequestPlan(f"{prefix}scene-{len(plans)}", snapshot.strategy, tuple(current)))
         return tuple(plans)
     if snapshot.strategy != "stitched_text_to_speech":
         raise RoutingConfigurationError("unsupported_tts_strategy")
     plans = []
     for turn in turns:
         for fragment in _split_dialogue_fragment(turn.text, snapshot.max_fragment_characters):
-            plans.append(TTSRequestPlan(f"fragment-{len(plans)}", snapshot.strategy, (DialogueTurn(turn.role, fragment),), snapshot.voice_bindings[turn.role]))
+            plans.append(TTSRequestPlan(f"{prefix}fragment-{len(plans)}", snapshot.strategy, (DialogueTurn(turn.role, fragment),), snapshot.voice_bindings[turn.role]))
     return tuple(plans)
 
 
@@ -131,27 +134,40 @@ def _split_dialogue_fragment(text: str, maximum: int) -> tuple[str, ...]:
     return tuple(fragments)
 
 
-def classify_tts_failure(status_code: int | None, dispatched: bool) -> Literal["retry", "terminal", "unknown_outcome"]:
-    """Only failures proven not accepted remotely may be retried automatically."""
+def classify_tts_failure(
+    status_code: int | None, dispatched: bool
+) -> Literal["pre_send", "retryable", "terminal", "unknown_outcome"]:
+    """Classify only outcomes that establish whether provider acceptance is possible."""
     if not dispatched:
-        return "terminal"
+        return "pre_send"
     if status_code in {429, 500, 503}:
-        return "retry"
-    if status_code is not None and 400 <= status_code < 500:
+        return "retryable"
+    if status_code is not None:
         return "terminal"
     return "unknown_outcome"
 
 
+def _fsync_directory(directory: Path) -> None:
+    descriptor = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def synthesize_elevenlabs_plan(plan: TTSRequestPlan, snapshot: ResolvedTTSSnapshot, output_path: str) -> str:
-    """Execute one planned ElevenLabs request. Ambiguous failures are never replayed here."""
+    """Execute one planned ElevenLabs request without replaying ambiguous outcomes."""
     if snapshot.provider != "elevenlabs" or not config.settings.elevenlabs_api_key:
         raise RoutingConfigurationError("invalid_elevenlabs_configuration")
     import requests
 
     destination = Path(output_path)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    staging = destination.parent / ".staging" / f"{destination.name}.part"
+    staging = destination.parent / ".staging" / f"{destination.name}.{plan.plan_id.replace('/', '_')}.part"
     staging.parent.mkdir(parents=True, exist_ok=True)
+    # A crash after rename is recoverable locally: never send the same plan again.
+    if destination.exists() and destination.stat().st_size > 0:
+        return str(destination)
     if plan.strategy == "text_to_dialogue_v3":
         payload: dict[str, Any] = {
             "model_id": "eleven_v3",
@@ -164,22 +180,36 @@ def synthesize_elevenlabs_plan(plan: TTSRequestPlan, snapshot: ResolvedTTSSnapsh
         payload = {"text": turn.text, "model_id": snapshot.model_id, "voice_settings": {}}
         endpoint = f"https://api.elevenlabs.io/v1/text-to-speech/{plan.voice_binding}"
     try:
-        response = requests.post(endpoint, json=payload, headers={"xi-api-key": config.settings.elevenlabs_api_key, "accept": "audio/mpeg"}, timeout=120, stream=True)
+        response = requests.post(
+            endpoint,
+            json=payload,
+            headers={
+                "xi-api-key": config.settings.elevenlabs_api_key,
+                "accept": "audio/mpeg",
+                "X-Request-Id": plan.plan_id,
+            },
+            timeout=120,
+            stream=True,
+        )
     except requests.RequestException as exc:
         raise RoutingConfigurationError("tts_outcome_unknown") from exc
     if not response.ok:
-        action = classify_tts_failure(response.status_code, dispatched=True)
-        raise RoutingConfigurationError(f"tts_{action}")
-    with staging.open("wb") as stream:
-        for chunk in response.iter_content(65536):
-            if not chunk:
-                continue
-            stream.write(chunk)
-        stream.flush()
-        os.fsync(stream.fileno())
-    if staging.stat().st_size == 0:
-        raise RoutingConfigurationError("tts_outcome_unknown")
-    os.replace(staging, destination)
+        raise RoutingConfigurationError(f"tts_{classify_tts_failure(response.status_code, dispatched=True)}")
+    try:
+        with staging.open("wb") as stream:
+            for chunk in response.iter_content(65536):
+                if chunk:
+                    stream.write(chunk)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if staging.stat().st_size == 0:
+            raise RoutingConfigurationError("tts_outcome_unknown")
+        os.replace(staging, destination)
+        _fsync_directory(destination.parent)
+    except RoutingConfigurationError:
+        raise
+    except OSError as exc:
+        raise RoutingConfigurationError("tts_outcome_unknown") from exc
     return str(destination)
 
 

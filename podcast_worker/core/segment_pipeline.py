@@ -21,10 +21,16 @@ from typing import Optional
 
 from podcast_worker.core import config as cfg
 from podcast_worker.core import persistence
+from podcast_worker.core.config import RoutingConfigurationError
 from podcast_worker.core.script_generator import generate_script
 from podcast_worker.core.tts_engine import synthesize, convert_to_wav
 from podcast_worker.core.beat_generator import save_beat_to_wav, generate_beat
-from podcast_worker.core.audio_mixer import build_podcast_audio, convert_to_mp3
+from podcast_worker.core.audio_mixer import (
+    _load_wav_to_numpy,
+    _save_numpy_to_wav,
+    build_podcast_audio,
+    convert_to_mp3,
+)
 from podcast_worker.core.exceptions import PodcastWorkerError
 
 
@@ -34,6 +40,23 @@ def _now_iso() -> str:
 
 def _short_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:12]}"
+
+def _public_error_code(exc: Exception) -> str:
+    """Keep provider/library diagnostics out of public project and segment records."""
+    if isinstance(exc, RoutingConfigurationError):
+        return str(exc) if str(exc).startswith(("tts_", "invalid_", "unsupported_")) else "generation_failed"
+    return "generation_failed"
+
+
+def _tts_attempt_outcome(exc: RoutingConfigurationError) -> str:
+    if str(exc) == "tts_retryable":
+        return "retryable"
+    if str(exc) == "tts_terminal":
+        return "terminal"
+    if str(exc) == "tts_pre_send":
+        return "pre_send"
+    return "unknown_outcome"
+
 
 
 # ── Pipeline entry point (called from a background thread) ───────────────
@@ -53,9 +76,8 @@ def run_project_pipeline(db_path: str, project_id: str, output_dir: str,
         _run_pipeline(db_path, project_id, output_dir, topic, bpm, duration_minutes,
                       voice_id, outline, interviewer_profile, sme_profile)
     except Exception as exc:
-        # Project-level failure — persist error and mark failed if recoverable
-        _persist_project_failure(db_path, project_id, str(exc))
-
+        # Provider exception details are not safe to expose through project manifests.
+        _persist_project_failure(db_path, project_id, _public_error_code(exc))
 
 def _run_pipeline(db_path: str, project_id: str, output_dir: str,
                   topic: str, bpm: int, duration_minutes: int,
@@ -126,23 +148,24 @@ def _run_pipeline(db_path: str, project_id: str, output_dir: str,
                 ready_count += 1
         except PodcastWorkerError as exc:
             any_failed = True
-            _persist_segment_failure(db_path, seg["segment_id"], str(exc))
+            _persist_segment_failure(db_path, seg["segment_id"], _public_error_code(exc))
         except Exception as exc:
             any_failed = True
-            _persist_segment_failure(db_path, seg["segment_id"], str(exc))
+            _persist_segment_failure(db_path, seg["segment_id"], _public_error_code(exc))
 
-    # 5. Determine final project status
-    if any_failed and ready_count == 0:
+    # Only a complete persisted ready manifest may create a final artifact.
+    manifest = _sync_get_segments(db_path, project_id)
+    ready_segments = [
+        item for item in manifest
+        if item["status"] == "ready" and item.get("primary_audio_artifact_id")
+    ]
+    if any_failed and not ready_segments:
         _sync_status(db_path, project_id, "failed")
-    elif any_failed:
-        # Partially ready — final_download_ready stays false per spec
+    elif any_failed or len(ready_segments) != total_segments:
         _sync_status(db_path, project_id, "partially_ready")
-    elif ready_count == total_segments:
-        # All segments ready — create final MP3 artifact
-        _create_final_artifact(db_path, project_id, output_dir, segments, beat_path,
-                               bpm, duration_minutes)
     else:
-        _sync_status(db_path, project_id, "partially_ready")
+        _create_final_artifact(db_path, project_id, output_dir, manifest, beat_path,
+                               bpm, duration_minutes)
 
 
 def _process_segment(db_path: str, project_id: str, segment: dict,
@@ -178,31 +201,45 @@ def _process_segment(db_path: str, project_id: str, segment: dict,
         from podcast_worker.core.tts_engine import plan_dialogue_requests, synthesize_elevenlabs_plan
         from pydub import AudioSegment
 
-        plans = plan_dialogue_requests(text, tts_snapshot)
+        plans = plan_dialogue_requests(text, tts_snapshot, namespace=f"{project_id}:{seg_id}")
         rendered_by_plan: dict[str, str] = {}
 
         for plan in plans:
             _persist_tts_plan(db_path, project_id, seg_id, plan)
 
         def render(plan):
-            attempt_id = _short_id("att")
             characters = len("".join(turn.text for turn in plan.turns))
-            _append_tts_ledger_entry(db_path, ledger_id, plan.plan_id, attempt_id, "reserved", characters)
-            _persist_tts_attempt(db_path, ledger_id, plan, attempt_id, tts_snapshot, "dispatched")
-            try:
-                rendered_path = synthesize_elevenlabs_plan(
-                    plan, tts_snapshot, str(speech_path.with_name(f"{speech_path.stem}-{plan.plan_id}.mp3"))
-                )
-            except Exception as exc:
-                _persist_tts_attempt(
-                    db_path, ledger_id, plan, attempt_id, tts_snapshot, "unknown_outcome",
-                    {"error": str(exc)},
-                )
-                raise
-            _persist_tts_attempt(db_path, ledger_id, plan, attempt_id, tts_snapshot, "published")
-            _append_tts_ledger_entry(db_path, ledger_id, plan.plan_id, attempt_id, "actual", characters)
-            _append_tts_ledger_entry(db_path, ledger_id, plan.plan_id, attempt_id, "released", characters)
-            return plan.plan_id, rendered_path
+            for attempt_number in range(max(1, tts_snapshot.max_attempts)):
+                attempt_id = _short_id("att")
+                _append_tts_ledger_entry(db_path, ledger_id, plan.plan_id, attempt_id, "reserved", characters)
+                _persist_tts_attempt(db_path, ledger_id, plan, attempt_id, tts_snapshot, "pre_send")
+                _persist_tts_attempt(db_path, ledger_id, plan, attempt_id, tts_snapshot, "dispatched")
+                try:
+                    rendered_path = synthesize_elevenlabs_plan(
+                        plan, tts_snapshot, str(speech_path.with_name(f"{speech_path.stem}-{plan.plan_id}.mp3"))
+                    )
+                except RoutingConfigurationError as exc:
+                    outcome = _tts_attempt_outcome(exc)
+                    _persist_tts_attempt(
+                        db_path, ledger_id, plan, attempt_id, tts_snapshot, outcome,
+                        {"code": outcome},
+                    )
+                    _append_tts_ledger_entry(db_path, ledger_id, plan.plan_id, attempt_id, "released", characters)
+                    if outcome == "retryable" and attempt_number + 1 < max(1, tts_snapshot.max_attempts):
+                        continue
+                    raise
+                except Exception:
+                    _persist_tts_attempt(
+                        db_path, ledger_id, plan, attempt_id, tts_snapshot, "unknown_outcome",
+                        {"code": "unknown_outcome"},
+                    )
+                    _append_tts_ledger_entry(db_path, ledger_id, plan.plan_id, attempt_id, "released", characters)
+                    raise RoutingConfigurationError("tts_outcome_unknown")
+                _persist_tts_attempt(db_path, ledger_id, plan, attempt_id, tts_snapshot, "published")
+                _append_tts_ledger_entry(db_path, ledger_id, plan.plan_id, attempt_id, "actual", characters)
+                _append_tts_ledger_entry(db_path, ledger_id, plan.plan_id, attempt_id, "released", characters)
+                return plan.plan_id, rendered_path
+            raise RoutingConfigurationError("tts_outcome_unknown")
 
         worker_count = min(len(plans), max(1, tts_snapshot.max_concurrent_requests))
         with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix=f"tts-{seg_id}") as executor:
@@ -243,9 +280,13 @@ def _process_segment(db_path: str, project_id: str, segment: dict,
         duration_minutes=duration_minutes,
     )
     mixed_mp3 = Path(output_dir) / f"mixed_{seg_id}.mp3"
-    convert_to_mp3(str(mixed_wav), str(mixed_mp3))
-
     # ── ready ──
+    duration_seconds, loudness_dbfs, true_peak = _validated_audio_metadata(mixed_wav)
+    convert_to_mp3(str(mixed_wav), str(mixed_mp3))
+    checksum = _sha256_file(mixed_mp3)
+    if checksum is None or not mixed_mp3.exists() or mixed_mp3.stat().st_size == 0:
+        raise PodcastWorkerError("segment_audio_publication_failed")
+
     artifact_id = _short_id("art")
     artifact = {
         "artifact_id": artifact_id,
@@ -253,69 +294,48 @@ def _process_segment(db_path: str, project_id: str, segment: dict,
         "segment_id": seg_id,
         "kind": "segment_audio",
         "content_type": "audio/mpeg",
-        "duration_seconds": float(duration_minutes * 60.0),
-        "size_bytes": mixed_mp3.stat().st_size if mixed_mp3.exists() else None,
-        "checksum_sha256": _sha256_file(mixed_mp3) if mixed_mp3.exists() else None,
+        "duration_seconds": duration_seconds,
+        "size_bytes": mixed_mp3.stat().st_size,
+        "checksum_sha256": checksum,
         "status": "ready",
         "download_url": f"/api/v1/artifacts/{artifact_id}",
         "created_at": _now_iso(),
     }
     _sync_add_artifact(db_path, artifact)
-
-    _sync_update_segment_ready(db_path, seg_id, artifact_id,
-                               float(duration_minutes * 60.0))
+    _sync_update_segment_ready(db_path, seg_id, artifact_id, duration_seconds)
 
 
 def _create_final_artifact(db_path: str, project_id: str, output_dir: str,
                            segments: list[dict], beat_path: Path, bpm: int,
                            duration_minutes: int) -> None:
-    """Concatenate all segment audio into a final MP3."""
+    """Publish a final MP3 only from a complete, ordered ready-segment manifest."""
     out = Path(output_dir)
     final_wav = out / f"final_{project_id}.wav"
     final_mp3 = out / f"final_{project_id}.mp3"
+    manifest = _sync_get_segments(db_path, project_id)
+    if (
+        not manifest
+        or [item["index"] for item in manifest] != list(range(len(manifest)))
+        or any(
+            item["status"] != "ready" or not item.get("primary_audio_artifact_id")
+            for item in manifest
+        )
+    ):
+        raise PodcastWorkerError("final_manifest_incomplete")
 
-    # Simple concatenation: mix all segment speech+beat into one final file
-    # Re-use the last segment's mixing approach but for all segments
-    all_speech_wavs = []
-    for seg in segments:
-        sw = out / f"speech_{seg['segment_id']}.wav"
-        if sw.exists():
-            all_speech_wavs.append(str(sw))
+    ordered_audio = []
+    for item in manifest:
+        mixed_wav = out / f"mixed_{item['segment_id']}.wav"
+        if not mixed_wav.is_file():
+            raise PodcastWorkerError("final_manifest_audio_missing")
+        ordered_audio.append(_load_wav_to_numpy(str(mixed_wav)))
 
-    if not all_speech_wavs:
-        return
-
-    # For simplicity, concatenate the mixed files
-    import numpy as np
-    import wave
-
-    combined = None
-    sample_rate = cfg.SAMPLE_RATE
-    for seg in segments:
-        mixed_wav = out / f"mixed_{seg['segment_id']}.wav"
-        if not mixed_wav.exists():
-            continue
-        try:
-            with wave.open(str(mixed_wav), "rb") as wf:
-                frames = wf.readframes(wf.getnframes())
-                audio = np.frombuffer(frames, dtype=np.int16)
-                if combined is None:
-                    combined = audio
-                else:
-                    combined = np.concatenate([combined, audio])
-        except Exception:
-            continue
-
-    if combined is None:
-        return
-
-    with wave.open(str(final_wav), "wb") as wf:
-        wf.setnchannels(1)
-        wf.setsampwidth(2)
-        wf.setframerate(sample_rate)
-        wf.writeframes(combined.tobytes())
-
+    _save_numpy_to_wav(np.concatenate(ordered_audio), str(final_wav))
+    duration_seconds, loudness_dbfs, true_peak = _validated_audio_metadata(final_wav)
     convert_to_mp3(str(final_wav), str(final_mp3))
+    checksum = _sha256_file(final_mp3)
+    if checksum is None or not final_mp3.exists() or final_mp3.stat().st_size == 0:
+        raise PodcastWorkerError("final_audio_publication_failed")
 
     final_artifact_id = _short_id("art")
     artifact = {
@@ -324,18 +344,35 @@ def _create_final_artifact(db_path: str, project_id: str, output_dir: str,
         "segment_id": None,
         "kind": "final_mp3",
         "content_type": "audio/mpeg",
-        "duration_seconds": float(duration_minutes * 60.0),
-        "size_bytes": final_mp3.stat().st_size if final_mp3.exists() else None,
-        "checksum_sha256": _sha256_file(final_mp3) if final_mp3.exists() else None,
+        "duration_seconds": duration_seconds,
+        "size_bytes": final_mp3.stat().st_size,
+        "checksum_sha256": checksum,
         "status": "ready",
         "download_url": f"/api/v1/artifacts/{final_artifact_id}",
         "created_at": _now_iso(),
     }
     _sync_add_artifact(db_path, artifact)
-
     _sync_status(db_path, project_id, "ready",
                  final_download_ready=True, final_artifact_id=final_artifact_id)
 
+
+def _validated_audio_metadata(path: Path) -> tuple[float, float, float]:
+    """Decode WAV media and enforce publication-safe loudness and peak bounds."""
+    import wave
+
+    with wave.open(str(path), "rb") as wav:
+        if wav.getsampwidth() != 2 or wav.getnchannels() not in {1, 2}:
+            raise PodcastWorkerError("unsupported_final_audio_format")
+        frames = wav.getnframes()
+        sample_rate = wav.getframerate()
+        if not frames or not sample_rate:
+            raise PodcastWorkerError("empty_final_audio")
+        samples = np.frombuffer(wav.readframes(frames), dtype=np.int16).astype(np.float32) / 32768.0
+    peak = float(np.max(np.abs(samples)))
+    loudness_dbfs = 20.0 * np.log10(max(float(np.sqrt(np.mean(np.square(samples)))), 1e-12))
+    if peak > 0.981 or loudness_dbfs < -60.0:
+        raise PodcastWorkerError("final_audio_quality_invalid")
+    return frames / sample_rate, loudness_dbfs, peak
 
 def _persist_tts_plan(db_path: str, project_id: str, segment_id: str, plan) -> None:
     persistence._upsert_durable_record(db_path, "tts_request_plans", {

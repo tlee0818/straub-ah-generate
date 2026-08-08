@@ -254,13 +254,30 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_ledger_entries_ledger ON episode_ledger_entries(ledger_id);
         CREATE INDEX IF NOT EXISTS idx_work_reconcile ON work_items(state, lease_expires_at);
         CREATE INDEX IF NOT EXISTS idx_tts_plans_reconcile ON tts_request_plans(state, lease_expires_at);
-        INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (2, CURRENT_TIMESTAMP);
+        INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (3, CURRENT_TIMESTAMP);
 
         CREATE INDEX IF NOT EXISTS idx_segments_project ON segments(project_id);
         CREATE INDEX IF NOT EXISTS idx_artifacts_project ON artifacts(project_id);
         CREATE INDEX IF NOT EXISTS idx_artifacts_segment ON artifacts(segment_id);
         CREATE INDEX IF NOT EXISTS idx_errors_project ON project_errors(project_id);
     """)
+    # Existing installations may predate durable routing columns.  Keep this
+    # additive migration serialized with all other writers.
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(outline_previews)")}
+        for name, definition in (
+            ("llm_snapshot_id", "TEXT REFERENCES execution_snapshots(snapshot_id)"),
+            ("tts_snapshot_id", "TEXT REFERENCES execution_snapshots(snapshot_id)"),
+            ("tts_routing_revision", "TEXT"),
+        ):
+            if name not in columns:
+                conn.execute(f"ALTER TABLE outline_previews ADD COLUMN {name} {definition}")
+        conn.execute("INSERT OR IGNORE INTO schema_migrations(version, applied_at) VALUES (3, ?)", (_now_iso(),))
+    except Exception:
+        conn.rollback()
+        raise
+    conn.commit()
 
 
 # ── project helpers ─────────────────────────────────────────────────────
@@ -537,8 +554,8 @@ def _get_preview_binding(db_path: str, preview_id: str, owner_id: str) -> dict |
 
 
 def _consume_preview_binding(db_path: str, preview_id: str, owner_id: str, project_id: str,
-                             llm_profile_id: str, tts_profile_id: str, routing_revision: str,
-                             tts_routing_revision: str) -> str:
+                             topic: str, bpm: int, duration_minutes: int, llm_profile_id: str,
+                             tts_profile_id: str, routing_revision: str, tts_routing_revision: str) -> str:
     conn = _get_conn(db_path)
     _ensure_schema(conn)
     conn.execute("BEGIN IMMEDIATE")
@@ -551,9 +568,9 @@ def _consume_preview_binding(db_path: str, preview_id: str, owner_id: str, proje
             result = "preview_expired"
         elif not row["tts_snapshot_id"]:
             result = "preview_binding_required"
-        elif (row["llm_profile_id"], row["tts_profile_id"], row["routing_revision"],
-              row["tts_routing_revision"]) != (llm_profile_id, tts_profile_id, routing_revision,
-                                                tts_routing_revision):
+        elif (row["topic"], row["bpm"], row["duration_minutes"], row["llm_profile_id"], row["tts_profile_id"],
+              row["routing_revision"], row["tts_routing_revision"]) != (topic, bpm, duration_minutes,
+              llm_profile_id, tts_profile_id, routing_revision, tts_routing_revision):
             result = "preview_profile_mismatch"
         else:
             conn.execute("UPDATE outline_previews SET consumed_at = ?, project_id = ? WHERE outline_preview_id = ?",
@@ -578,6 +595,69 @@ def _append_ledger_entry(db_path: str, entry: dict) -> None:
          entry["correlation_id"], entry["resource_unit"], entry["amount"], entry["state"],
          json.dumps(entry["pricing"], sort_keys=True) if entry.get("pricing") else None,
          entry.get("attempt_id"), entry.get("created_at", _now_iso())))
+    conn.commit()
+def _reserve_ledger_operation(db_path: str, entry: dict, attempt: dict) -> bool:
+    """Atomically record an accepted attempt and its reservation before dispatch."""
+    conn = _get_conn(db_path)
+    _ensure_schema(conn)
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        ledger = conn.execute("SELECT policy_json FROM episode_ledgers WHERE ledger_id = ?",
+                              (entry["ledger_id"],)).fetchone()
+        if ledger is None:
+            raise ValueError("unknown ledger")
+        policy = json.loads(ledger["policy_json"])
+        cap = policy.get("caps", {}).get(entry["category"])
+        used = conn.execute("""SELECT COALESCE(SUM(amount), 0) AS total FROM episode_ledger_entries
+            WHERE ledger_id = ? AND category = ? AND state IN ('reserved', 'actual')""",
+                            (entry["ledger_id"], entry["category"])).fetchone()["total"]
+        accepted = policy.get("mode", policy.get("enforcement", "off")) != "enforced" or cap is None or used + entry["amount"] <= cap
+        if accepted:
+            conn.execute("""INSERT INTO execution_attempts
+                (attempt_id, ledger_id, plan_id, category, correlation_id, snapshot_revision, binding_json, outcome, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'accepted', ?)""",
+                (attempt["attempt_id"], entry["ledger_id"], attempt.get("plan_id"), entry["category"],
+                 entry["correlation_id"], attempt["snapshot_revision"],
+                 json.dumps(attempt["binding"], sort_keys=True), _now_iso()))
+            conn.execute("""INSERT INTO episode_ledger_entries
+                (entry_id, ledger_id, category, operation_type, correlation_id, resource_unit, amount, state, pricing_json, attempt_id, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 'reserved', ?, ?, ?)""",
+                (entry["entry_id"], entry["ledger_id"], entry["category"], entry["operation_type"],
+                 entry["correlation_id"], entry["resource_unit"], entry["amount"],
+                 json.dumps(entry.get("pricing", {}), sort_keys=True), attempt["attempt_id"], _now_iso()))
+    except Exception:
+        conn.rollback()
+        raise
+    conn.commit()
+    return accepted
+
+
+def _settle_ledger_operation(db_path: str, ledger_id: str, attempt_id: str, entry: dict,
+                             outcome: str, usage: dict | None = None, error: dict | None = None) -> None:
+    conn = _get_conn(db_path)
+    _ensure_schema(conn)
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        conn.execute("""UPDATE execution_attempts SET outcome = ?, usage_json = ?, cost_micros = ?, error_json = ?
+            WHERE attempt_id = ? AND ledger_id = ?""",
+            (outcome, json.dumps(usage, sort_keys=True) if usage else None, entry.get("cost_micros"),
+             json.dumps(error, sort_keys=True) if error else None, attempt_id, ledger_id))
+        state = "actual" if outcome == "succeeded" else "released"
+        conn.execute("""UPDATE episode_ledger_entries SET state = ? WHERE ledger_id = ? AND attempt_id = ?
+            AND state = 'reserved'""", (state, ledger_id, attempt_id))
+        if conn.execute("SELECT changes()").fetchone()[0] != 1:
+            raise ValueError("missing ledger reservation")
+    except Exception:
+        conn.rollback()
+        raise
+    conn.commit()
+
+
+def _update_preview_outline(db_path: str, preview_id: str, outline: dict) -> None:
+    conn = _get_conn(db_path)
+    _ensure_schema(conn)
+    conn.execute("UPDATE outline_previews SET outline_json = ? WHERE outline_preview_id = ?",
+                 (json.dumps(outline, sort_keys=True), preview_id))
     conn.commit()
 
 
@@ -830,14 +910,26 @@ async def get_preview_binding(db_path: str, preview_id: str, owner_id: str) -> d
 
 
 async def consume_preview_binding(db_path: str, preview_id: str, owner_id: str, project_id: str,
-                                  llm_profile_id: str, tts_profile_id: str, routing_revision: str,
-                                  tts_routing_revision: str) -> str:
+                                  topic: str, bpm: int, duration_minutes: int, llm_profile_id: str,
+                                  tts_profile_id: str, routing_revision: str, tts_routing_revision: str) -> str:
     return await _run_in_executor(_consume_preview_binding, db_path, preview_id, owner_id, project_id,
-                                  llm_profile_id, tts_profile_id, routing_revision, tts_routing_revision)
+                                  topic, bpm, duration_minutes, llm_profile_id, tts_profile_id,
+                                  routing_revision, tts_routing_revision)
 
 
 async def append_ledger_entry(db_path: str, entry: dict) -> None:
     return await _run_in_executor(_append_ledger_entry, db_path, entry)
+async def reserve_ledger_operation(db_path: str, entry: dict, attempt: dict) -> bool:
+    return await _run_in_executor(_reserve_ledger_operation, db_path, entry, attempt)
+
+
+async def settle_ledger_operation(db_path: str, ledger_id: str, attempt_id: str, entry: dict,
+                                  outcome: str, usage: dict | None = None, error: dict | None = None) -> None:
+    return await _run_in_executor(_settle_ledger_operation, db_path, ledger_id, attempt_id, entry, outcome, usage, error)
+
+
+async def update_preview_outline(db_path: str, preview_id: str, outline: dict) -> None:
+    return await _run_in_executor(_update_preview_outline, db_path, preview_id, outline)
 
 
 async def upsert_durable_record(db_path: str, table: str, record: dict) -> None:

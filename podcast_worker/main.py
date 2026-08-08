@@ -61,6 +61,8 @@ from podcast_worker.core.tts_engine import synthesize, convert_to_wav
 from podcast_worker.core.beat_generator import save_beat_to_wav, generate_beat
 from podcast_worker.core.audio_mixer import build_podcast_audio, convert_to_mp3
 from podcast_worker.core.models_v1 import ErrorEnvelope, ErrorResponse
+from podcast_worker.core import persistence
+from podcast_worker.core.segment_pipeline import run_project_pipeline
 
 # ---------------------------------------------------------------------------
 # Application state
@@ -97,6 +99,21 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Application lifespan — startup/shutdown logic."""
     state.start_time = time.time()
     state.output_dir.mkdir(parents=True, exist_ok=True)
+    lease_expires_at = (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat()
+    claimed = await persistence.claim_reconcilable_work(cfg.settings.db_path, "work_items", "startup", lease_expires_at)
+    for item in claimed:
+        if item["kind"] != "project_pipeline" or not item.get("project_id"):
+            continue
+        project = await persistence.get_project(cfg.settings.db_path, item["project_id"])
+        if project is None:
+            continue
+        thread = threading.Thread(
+            target=run_project_pipeline,
+            args=(cfg.settings.db_path, project["project_id"], str(state.output_dir), project["topic"],
+                  project["bpm"], project["duration_minutes"], None),
+            daemon=True,
+        )
+        thread.start()
     yield
     # Cleanup on shutdown (if needed)
 
@@ -180,6 +197,8 @@ async def v1_http_exception_handler(request: Request, exc: HTTPException):
             502: "provider_error",
         }
         code = code_map.get(exc.status_code, "unknown_error")
+        if isinstance(exc.detail, dict) and isinstance(exc.detail.get("error"), dict):
+            return JSONResponse(status_code=exc.status_code, content=exc.detail)
         return JSONResponse(
             status_code=exc.status_code,
             content=ErrorEnvelope(

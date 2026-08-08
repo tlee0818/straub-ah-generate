@@ -52,9 +52,9 @@ def test_preview_binding_is_paired_immutable_owner_scoped_and_one_time(tmp_path)
     assert stored["tts_snapshot_id"] == "tsn_a"
     assert persistence._get_preview_binding(db_path, "opv_a", "other-owner") is None
     persistence._create_project(db_path, "prj_a", "owner-a", "topic", 120, 5)
-    assert persistence._consume_preview_binding(db_path, "opv_a", "owner-a", "prj_a", "llm-a", "tts-b", "llm-r1", "tts-r1") == "preview_profile_mismatch"
-    assert persistence._consume_preview_binding(db_path, "opv_a", "owner-a", "prj_a", "llm-a", "tts-a", "llm-r1", "tts-r1") == "ok"
-    assert persistence._consume_preview_binding(db_path, "opv_a", "owner-a", "prj_b", "llm-a", "tts-a", "llm-r1", "tts-r1") == "preview_expired"
+    assert persistence._consume_preview_binding(db_path, "opv_a", "owner-a", "prj_a", "topic", 120, 5, "llm-a", "tts-b", "llm-r1", "tts-r1") == "preview_profile_mismatch"
+    assert persistence._consume_preview_binding(db_path, "opv_a", "owner-a", "prj_a", "topic", 120, 5, "llm-a", "tts-a", "llm-r1", "tts-r1") == "ok"
+    assert persistence._consume_preview_binding(db_path, "opv_a", "owner-a", "prj_b", "topic", 120, 5, "llm-a", "tts-a", "llm-r1", "tts-r1") == "preview_expired"
 
 
 def test_expired_preview_cannot_be_consumed(tmp_path):
@@ -64,7 +64,7 @@ def test_expired_preview_cannot_be_consumed(tmp_path):
         db_path, _preview((datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat()), llm, tts,
         {"ledger_id": "led_a", "policy": {"enforcement": "off"}, "currency": None},
     )
-    assert persistence._consume_preview_binding(db_path, "opv_a", "owner-a", "prj_a", "llm-a", "tts-a", "llm-r1", "tts-r1") == "preview_expired"
+    assert persistence._consume_preview_binding(db_path, "opv_a", "owner-a", "prj_a", "topic", 120, 5, "llm-a", "tts-a", "llm-r1", "tts-r1") == "preview_expired"
 
 
 def test_project_execution_hydrates_persisted_snapshots_and_records_shared_categories(tmp_path):
@@ -91,3 +91,45 @@ def test_project_execution_hydrates_persisted_snapshots_and_records_shared_categ
         "SELECT category FROM episode_ledger_entries WHERE ledger_id = ? ORDER BY entry_id", ("led_a",)
     ).fetchall()
     assert [row["category"] for row in rows] == ["llm", "tts"]
+def test_preview_consumption_requires_canonical_topic_bpm_and_duration(tmp_path):
+    db_path = str(tmp_path / "worker.db")
+    llm, tts = _snapshots()
+    persistence._create_preview_binding(
+        db_path, _preview((datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()), llm, tts,
+        {"ledger_id": "led_a", "policy": {"mode": "off"}, "currency": None},
+    )
+    persistence._create_project(db_path, "prj_a", "owner-a", "other topic", 121, 6)
+    assert persistence._consume_preview_binding(
+        db_path, "opv_a", "owner-a", "prj_a", "other topic", 121, 6, "llm-a", "tts-a", "llm-r1", "tts-r1"
+    ) == "preview_profile_mismatch"
+
+
+def test_atomic_ledger_reservation_enforces_shared_cap(tmp_path):
+    db_path = str(tmp_path / "worker.db")
+    persistence._create_project(db_path, "prj_a", "owner-a", "topic", 120, 5)
+    llm, tts = _snapshots()
+    persistence._create_project_execution(
+        db_path, "prj_a", "owner-a", llm, tts,
+        {"ledger_id": "led_a", "policy": {"mode": "enforced", "caps": {"llm": 1}}, "currency": "USD"},
+    )
+    entry = {"ledger_id": "led_a", "category": "llm", "operation_type": "outline",
+             "correlation_id": "outline", "resource_unit": "request", "amount": 1}
+    assert persistence._reserve_ledger_operation(
+        db_path, {**entry, "entry_id": "entry_a"}, {"attempt_id": "attempt_a", "snapshot_revision": "llm-r1", "binding": {}}
+    )
+    assert not persistence._reserve_ledger_operation(
+        db_path, {**entry, "entry_id": "entry_b"}, {"attempt_id": "attempt_b", "snapshot_revision": "llm-r1", "binding": {}}
+    )
+def test_restart_reconciliation_claims_pending_and_expired_leases(tmp_path):
+    db_path = str(tmp_path / "worker.db")
+    persistence._upsert_durable_record(db_path, "work_items", {
+        "work_id": "pending", "kind": "project_pipeline", "state": "pending", "payload_json": {},
+    })
+    persistence._upsert_durable_record(db_path, "work_items", {
+        "work_id": "stale", "kind": "project_pipeline", "state": "leased", "payload_json": {},
+        "lease_owner": "dead", "lease_expires_at": (datetime.now(timezone.utc) - timedelta(seconds=1)).isoformat(),
+    })
+    claimed = persistence._claim_reconcilable_work(
+        db_path, "work_items", "restart", (datetime.now(timezone.utc) + timedelta(minutes=1)).isoformat()
+    )
+    assert {row["work_id"] for row in claimed} == {"pending", "stale"}

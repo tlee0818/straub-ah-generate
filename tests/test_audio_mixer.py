@@ -13,12 +13,13 @@ import numpy as np
 import pytest
 
 from podcast_worker.core.audio_mixer import (
-    detect_speech_regions,
-    mix_with_ducking,
-    build_podcast_audio,
-    convert_to_mp3,
+    _fit_beat_to_duration,
     _load_wav_to_numpy,
     _save_numpy_to_wav,
+    build_podcast_audio,
+    convert_to_mp3,
+    detect_speech_regions,
+    mix_with_ducking,
 )
 
 SAMPLE_RATE = 44100
@@ -188,6 +189,22 @@ class TestBuildPodcastAudio:
                 assert duration > 4.5, f"Expected >4.5s, got {duration:.1f}s"
 
 
+    def test_stereo_samples_are_not_interleaved_as_mono(self):
+        left = np.full(100, 0.25, dtype=np.float32)
+        right = np.full(100, -0.5, dtype=np.float32)
+        stereo = np.column_stack((left, right))
+        with tempfile.TemporaryDirectory() as tmpdir:
+            path = os.path.join(tmpdir, "stereo.wav")
+            _save_numpy_to_wav(stereo, path)
+            restored = _load_wav_to_numpy(path)
+        assert restored.shape == stereo.shape
+        np.testing.assert_allclose(restored[:, 0], left, atol=1 / 32767)
+        np.testing.assert_allclose(restored[:, 1], right, atol=1 / 32767)
+
+    def test_beat_is_trimmed_to_measured_speech_frames(self):
+        beat = _make_test_beat(2.0)
+        fitted = _fit_beat_to_duration(beat, int(SAMPLE_RATE * 0.25))
+        assert fitted.shape == (int(SAMPLE_RATE * 0.25), 2)
 class TestConvertToMP3:
     def test_convert_to_mp3(self):
         speech = _make_test_speech(0.3)
