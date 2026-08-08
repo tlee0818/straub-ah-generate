@@ -502,6 +502,33 @@ def _add_project_error(db_path: str, project_id: str, code: str, message: str,
         (project_id, code, message, 1 if retryable else 0, _now_iso()),
     )
     conn.commit()
+def _persist_execution_snapshot(conn: sqlite3.Connection, snapshot: dict, kind: str, now: str) -> str:
+    """Insert an immutable snapshot or return the canonical row's existing ID."""
+    canonical = json.dumps(snapshot["payload"], sort_keys=True, separators=(",", ":"))
+    conn.execute(
+        """INSERT OR IGNORE INTO execution_snapshots
+           (snapshot_id, snapshot_type, profile_id, revision, canonical_json, sha256, created_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?)""",
+        (
+            snapshot["snapshot_id"],
+            kind,
+            snapshot["profile_id"],
+            snapshot["revision"],
+            canonical,
+            snapshot["sha256"],
+            now,
+        ),
+    )
+    row = conn.execute(
+        """SELECT snapshot_id FROM execution_snapshots
+           WHERE snapshot_type = ? AND profile_id = ? AND revision = ? AND sha256 = ?""",
+        (kind, snapshot["profile_id"], snapshot["revision"], snapshot["sha256"]),
+    ).fetchone()
+    if row is None:
+        raise sqlite3.IntegrityError("execution snapshot identity conflict")
+    return str(row["snapshot_id"])
+
+
 def _create_preview_binding(db_path: str, preview: dict, llm_snapshot: dict,
                             tts_snapshot: dict, ledger: dict) -> None:
     """Atomically persist immutable paired snapshots, preview, and episode ledger."""
@@ -510,15 +537,10 @@ def _create_preview_binding(db_path: str, preview: dict, llm_snapshot: dict,
     now = _now_iso()
     conn.execute("BEGIN IMMEDIATE")
     try:
-        snapshot_ids = []
-        for snapshot, kind in ((llm_snapshot, "llm"), (tts_snapshot, "tts")):
-            canonical = json.dumps(snapshot["payload"], sort_keys=True, separators=(",", ":"))
-            conn.execute("""INSERT OR IGNORE INTO execution_snapshots
-                (snapshot_id, snapshot_type, profile_id, revision, canonical_json, sha256, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (snapshot["snapshot_id"], kind, snapshot["profile_id"], snapshot["revision"],
-                 canonical, snapshot["sha256"], now))
-            snapshot_ids.append(snapshot["snapshot_id"])
+        snapshot_ids = [
+            _persist_execution_snapshot(conn, snapshot, kind, now)
+            for snapshot, kind in ((llm_snapshot, "llm"), (tts_snapshot, "tts"))
+        ]
         conn.execute("""INSERT INTO episode_ledgers
             (ledger_id, owner_id, llm_snapshot_id, tts_snapshot_id, policy_json, currency, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?)""",
@@ -711,17 +733,14 @@ def _create_project_execution(db_path: str, project_id: str, owner_id: str, llm_
     now = _now_iso()
     conn.execute("BEGIN IMMEDIATE")
     try:
-        for snapshot, kind in ((llm_snapshot, "llm"), (tts_snapshot, "tts")):
-            canonical = json.dumps(snapshot["payload"], sort_keys=True, separators=(",", ":"))
-            conn.execute("""INSERT OR IGNORE INTO execution_snapshots
-                (snapshot_id, snapshot_type, profile_id, revision, canonical_json, sha256, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (snapshot["snapshot_id"], kind, snapshot["profile_id"], snapshot["revision"],
-                 canonical, snapshot["sha256"], now))
+        snapshot_ids = [
+            _persist_execution_snapshot(conn, snapshot, kind, now)
+            for snapshot, kind in ((llm_snapshot, "llm"), (tts_snapshot, "tts"))
+        ]
         conn.execute("""INSERT INTO episode_ledgers
             (ledger_id, owner_id, project_id, llm_snapshot_id, tts_snapshot_id, policy_json, currency, created_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (ledger["ledger_id"], owner_id, project_id, llm_snapshot["snapshot_id"], tts_snapshot["snapshot_id"],
+            (ledger["ledger_id"], owner_id, project_id, *snapshot_ids,
              json.dumps(ledger["policy"], sort_keys=True), ledger.get("currency"), now))
     except Exception:
         conn.rollback()

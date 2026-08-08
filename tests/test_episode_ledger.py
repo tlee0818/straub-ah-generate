@@ -57,6 +57,28 @@ def test_preview_binding_is_paired_immutable_owner_scoped_and_one_time(tmp_path)
     assert persistence._consume_preview_binding(db_path, "opv_a", "owner-a", "prj_b", "topic", 120, 5, "llm-a", "tts-a", "llm-r1", "tts-r1") == "preview_expired"
 
 
+def test_repeated_preview_reuses_canonical_snapshots(tmp_path):
+    db_path = str(tmp_path / "worker.db")
+    llm, tts = _snapshots()
+    expires_at = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
+    persistence._create_preview_binding(
+        db_path, _preview(expires_at), llm, tts,
+        {"ledger_id": "led_a", "policy": {"mode": "off"}, "currency": None},
+    )
+
+    second_preview = {**_preview(expires_at), "outline_preview_id": "opv_b"}
+    second_llm = {**llm, "snapshot_id": "lsn_b"}
+    second_tts = {**tts, "snapshot_id": "tsn_b"}
+    persistence._create_preview_binding(
+        db_path, second_preview, second_llm, second_tts,
+        {"ledger_id": "led_b", "policy": {"mode": "off"}, "currency": None},
+    )
+
+    stored = persistence._get_preview_binding(db_path, "opv_b", "owner-a")
+    assert stored["llm_snapshot_id"] == "lsn_a"
+    assert stored["tts_snapshot_id"] == "tsn_a"
+
+
 def test_expired_preview_cannot_be_consumed(tmp_path):
     db_path = str(tmp_path / "worker.db")
     llm, tts = _snapshots()
