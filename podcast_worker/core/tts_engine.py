@@ -194,7 +194,9 @@ def synthesize_elevenlabs_plan(plan: TTSRequestPlan, snapshot: ResolvedTTSSnapsh
     except requests.RequestException as exc:
         raise RoutingConfigurationError("tts_outcome_unknown") from exc
     if not response.ok:
-        raise RoutingConfigurationError(f"tts_{classify_tts_failure(response.status_code, dispatched=True)}")
+        outcome = classify_tts_failure(response.status_code, dispatched=True)
+        code = f"tts_http_{response.status_code}" if outcome == "terminal" else f"tts_{outcome}"
+        raise RoutingConfigurationError(code)
     try:
         with staging.open("wb") as stream:
             for chunk in response.iter_content(65536):
