@@ -29,7 +29,12 @@ from podcast_worker.core.script_generator import (
     generate_subtopic_research,
     generate_verified_section,
 )
-from podcast_worker.core.tts_engine import convert_to_wav, synthesize
+from podcast_worker.core.tts_engine import (
+    convert_to_wav,
+    plan_dialogue_requests,
+    synthesize,
+    synthesize_elevenlabs_plan,
+)
 
 
 class FenceLost(RuntimeError):
@@ -102,6 +107,40 @@ def _verification_payload(result) -> dict:
         "issues": list(result.issues),
         "verified_text": result.verified_text,
     }
+def _synthesize_snapshot(
+    text: str,
+    snapshot: cfg.ResolvedTTSSnapshot,
+    output_path: Path,
+    namespace: str,
+) -> str:
+    if snapshot.provider != "elevenlabs":
+        return synthesize(
+            text,
+            provider=snapshot.provider,
+            output_path=str(output_path),
+            voice=snapshot.voice_bindings["interviewer"],
+        )
+
+    from pydub import AudioSegment
+
+    plans = plan_dialogue_requests(text, snapshot, namespace=namespace)
+    if not plans:
+        raise RoutingConfigurationError("tts_empty_plan")
+    rendered_paths = [
+        synthesize_elevenlabs_plan(
+            plan,
+            snapshot,
+            str(output_path.with_name(f"{output_path.stem}-{index}.mp3")),
+        )
+        for index, plan in enumerate(plans)
+    ]
+    combined = AudioSegment.empty()
+    for rendered_path in rendered_paths:
+        combined += AudioSegment.from_file(rendered_path)
+    combined.export(output_path, format="mp3")
+    return str(output_path)
+
+
 
 
 
@@ -458,12 +497,12 @@ def _run_pipeline(db_path: str, work_id: str, owner: str, epoch: int, output_dir
             db_path, work_id, owner, epoch,
             f"{segment_id}:tts", segment_id, "tts",
             lambda: {
-                "output": synthesize(
+                "output": _synthesize_snapshot(
                     previous_text,
-                    provider=tts_snapshot.provider,
-                    output_path=str(speech_mp3),
-                    voice=tts_snapshot.voice_bindings["interviewer"],
-                ) or str(speech_mp3)
+                    tts_snapshot,
+                    speech_mp3,
+                    namespace=f"{project_id}:{segment_id}",
+                )
             },
         )
         convert_to_wav(str(speech_mp3), str(speech_wav))

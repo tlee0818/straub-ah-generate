@@ -50,6 +50,36 @@ def test_verification_result_is_persistable_and_blocks_rejected_text():
     with pytest.raises(RoutingConfigurationError, match="validation_failed"):
         segment_pipeline._verification_payload(blocked)
 
+def test_snapshot_tts_uses_bound_provider_and_voice(monkeypatch, tmp_path):
+    captured = {}
+
+    def fake_synthesize(text, **kwargs):
+        captured.update(text=text, **kwargs)
+        Path(kwargs["output_path"]).write_bytes(b"audio")
+        return kwargs["output_path"]
+
+    monkeypatch.setattr(segment_pipeline, "synthesize", fake_synthesize)
+    snapshot = SimpleNamespace(
+        provider="edge",
+        voice_bindings={"interviewer": "bound-voice"},
+    )
+    output = tmp_path / "speech.mp3"
+
+    result = segment_pipeline._synthesize_snapshot(
+        "Verified text",
+        snapshot,
+        output,
+        namespace="project:segment",
+    )
+
+    assert result == str(output)
+    assert captured == {
+        "text": "Verified text",
+        "provider": "edge",
+        "output_path": str(output),
+        "voice": "bound-voice",
+    }
+
 def test_pipeline_uses_persisted_llm_snapshot(monkeypatch):
     snapshot = _snapshot()
     captured = {}
