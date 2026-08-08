@@ -11,18 +11,18 @@
     {
       "id": "studio-dialogue",
       "label": "Studio dialogue",
-      "description": "Natural two-speaker ElevenLabs dialogue rendered with broadly available text-to-speech.",
-      "provider": "elevenlabs",
+      "description": "Natural two-speaker dialogue using resilient neural text-to-speech.",
+      "provider": "edge",
       "strategy": "stitched_text_to_speech",
-      "model_id": "eleven_multilingual_v2",
+      "model_id": "edge-neural",
       "output_format": "mp3_44100_128",
       "default_interviewer_voice_id": "interviewer-rachel",
       "default_guest_voice_id": "guest-adam",
       "voice_bindings": {
-        "interviewer-rachel": {"provider_voice_id": "21m00Tcm4TlvDq8ikWAM"},
-        "interviewer-bella": {"provider_voice_id": "EXAVITQu4vr4xnSDxMaL"},
-        "guest-adam": {"provider_voice_id": "pNInz6obpgDQGcFmaJgB"},
-        "guest-josh": {"provider_voice_id": "TxGEqnHWrfWFTfGW9XjX"}
+        "interviewer-rachel": {"provider_voice_id": "en-US-JennyNeural"},
+        "interviewer-bella": {"provider_voice_id": "en-US-AriaNeural"},
+        "guest-adam": {"provider_voice_id": "en-US-GuyNeural"},
+        "guest-josh": {"provider_voice_id": "en-US-ChristopherNeural"}
       },
       "max_scene_characters": 0,
       "max_scene_turns": 0,

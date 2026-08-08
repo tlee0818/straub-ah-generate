@@ -274,10 +274,15 @@ def resolve_tts_profile(profile_id: str | None = None, interviewer_voice_id: str
         raise RoutingConfigurationError("invalid_tts_profiles_json")
     selected = source["default_profile_id"] if profile_id in {None, "default"} else profile_id
     profile = next((item for item in source["profiles"] if isinstance(item, dict) and item.get("id") == selected), None)
-    if profile is None or profile.get("provider") != "elevenlabs":
+    if profile is None or profile.get("provider") not in {"elevenlabs", "edge"}:
         raise RoutingConfigurationError("unknown_tts_profile")
+    provider = profile["provider"]
     strategy = profile.get("strategy")
-    if strategy not in {"text_to_dialogue_v3", "stitched_text_to_speech"} or not settings.elevenlabs_api_key:
+    if strategy not in {"text_to_dialogue_v3", "stitched_text_to_speech"}:
+        raise RoutingConfigurationError("invalid_tts_profile")
+    if provider == "elevenlabs" and not settings.elevenlabs_api_key:
+        raise RoutingConfigurationError("invalid_tts_profile")
+    if provider == "edge" and strategy != "stitched_text_to_speech":
         raise RoutingConfigurationError("invalid_tts_profile")
     voices = {voice.get("id"): voice for voice in source["voices"] if isinstance(voice, dict) and isinstance(voice.get("id"), str)}
     requested = {"interviewer": interviewer_voice_id or profile.get("default_interviewer_voice_id"), "guest": guest_voice_id or profile.get("default_guest_voice_id")}
@@ -298,7 +303,7 @@ def resolve_tts_profile(profile_id: str | None = None, interviewer_voice_id: str
         raise RoutingConfigurationError("invalid_stitched_tts_profile")
     budget = _budget_policy(profile.get("budget"))
     snapshot_payload = {"profile": profile, "bindings": bindings, "budget": {"mode": budget.mode, "currency": budget.currency, "caps": dict(budget.caps), "pricing": dict(budget.pricing)}}
-    return ResolvedTTSSnapshot(str(selected), _revision("tts", snapshot_payload), "elevenlabs", strategy, model_id, str(profile.get("output_format", "mp3")), max_scene_characters, max_scene_turns, max_fragment_characters, MappingProxyType(bindings), int(profile.get("max_attempts", 1)), int(profile.get("context_max_request_ids", 0)), int(profile.get("context_max_age_seconds", 0)), profile.get("continuity_after_expiry"), int(profile.get("max_concurrent_requests", 1)), budget)
+    return ResolvedTTSSnapshot(str(selected), _revision("tts", snapshot_payload), provider, strategy, model_id, str(profile.get("output_format", "mp3")), max_scene_characters, max_scene_turns, max_fragment_characters, MappingProxyType(bindings), int(profile.get("max_attempts", 1)), int(profile.get("context_max_request_ids", 0)), int(profile.get("context_max_age_seconds", 0)), profile.get("continuity_after_expiry"), int(profile.get("max_concurrent_requests", 1)), budget)
 
 
 def validate_profile_pair(llm: ResolvedExecutionSnapshot, tts: ResolvedTTSSnapshot) -> None:

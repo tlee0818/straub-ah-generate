@@ -132,27 +132,32 @@ def _synthesize_snapshot(
     output_path: Path,
     namespace: str,
 ) -> str:
-    if snapshot.provider != "elevenlabs":
+    if snapshot.provider not in {"elevenlabs", "edge"} or not hasattr(snapshot, "strategy"):
         return synthesize(
             text,
             provider=snapshot.provider,
             output_path=str(output_path),
             voice=snapshot.voice_bindings["interviewer"],
         )
-
     from pydub import AudioSegment
 
     plans = plan_dialogue_requests(text, snapshot, namespace=namespace)
     if not plans:
         raise RoutingConfigurationError("tts_empty_plan")
-    rendered_paths = [
-        synthesize_elevenlabs_plan(
-            plan,
-            snapshot,
-            str(output_path.with_name(f"{output_path.stem}-{index}.mp3")),
-        )
-        for index, plan in enumerate(plans)
-    ]
+    rendered_paths: list[str] = []
+    for index, plan in enumerate(plans):
+        rendered_path = str(output_path.with_name(f"{output_path.stem}-{index}.mp3"))
+        if snapshot.provider == "elevenlabs":
+            rendered_paths.append(synthesize_elevenlabs_plan(plan, snapshot, rendered_path))
+        else:
+            rendered_paths.append(
+                synthesize(
+                    plan.turns[0].text,
+                    provider=snapshot.provider,
+                    output_path=rendered_path,
+                    voice=plan.voice_binding,
+                )
+            )
     combined = AudioSegment.empty()
     for rendered_path in rendered_paths:
         combined += AudioSegment.from_file(rendered_path)
