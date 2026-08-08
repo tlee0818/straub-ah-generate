@@ -601,6 +601,7 @@ def generate_section_draft(
         "You are a podcast script writer. You output raw JSON only.",
         prompt,
         provider=provider,
+        purpose="dialogue_draft",
         **kwargs,
     )
     segment = result.get("segment", result)
@@ -795,7 +796,6 @@ def generate_script(
             sme_profile=sme_profile,
             provider=provider,
             snapshot=snapshot,
-            purpose="dialogue_draft",
             **kwargs,
         )
         verification = generate_verified_section(

@@ -316,6 +316,29 @@ class TestPurposeRouting:
             ("openai", "dialogue_draft-model", "openai_json_object"),
             ("openai", "fact_verification-model", "openai_json_object"),
         ]
+    def test_section_draft_selects_dialogue_route(self, monkeypatch):
+        captured = {}
+
+        def provider(*_args, **kwargs):
+            captured.update(kwargs)
+            return {"segment": {"text": "Interviewer: Hello"}}
+
+        monkeypatch.setattr(script_generator, "_call_provider", provider)
+        outline = {"sections": [{"index": 0, "topic": "Section", "title": "Section"}]}
+
+        script_generator.generate_section_draft(
+            "Topic",
+            120,
+            1,
+            outline,
+            outline["sections"][0],
+            {},
+            {},
+            snapshot=_snapshot(),
+        )
+
+        assert captured["purpose"] == "dialogue_draft"
+
 
 
 class TestVerificationGate:
