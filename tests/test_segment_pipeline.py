@@ -29,6 +29,42 @@ def _tts_snapshot(max_concurrent_requests: int) -> ResolvedTTSSnapshot:
         MappingProxyType({"interviewer": "host", "guest": "guest"}), 1, 0, 0, None,
         max_concurrent_requests,
     )
+def test_pipeline_uses_persisted_llm_snapshot(monkeypatch):
+    snapshot = _snapshot()
+    captured = {}
+
+    monkeypatch.setattr(
+        segment_pipeline,
+        "_hydrate",
+        lambda *_: {
+            "work": {"project_id": "project", "topic": "topic", "bpm": 120, "duration_minutes": 1},
+            "outline": {"sections": [{"index": 0, "topic": "section"}]},
+            "segments": [{"segment_id": "segment"}],
+            "interviewer_profile": None,
+            "sme_profile": None,
+            "llm_snapshot": snapshot,
+            "tts_snapshot": _tts_snapshot(1),
+        },
+    )
+    monkeypatch.setattr(segment_pipeline, "_completed_result", lambda *_: None)
+    monkeypatch.setattr(segment_pipeline, "_transition", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        segment_pipeline,
+        "_provider_operation",
+        lambda *_args: _args[-1](),
+    )
+
+    def research(*_args, **kwargs):
+        captured.update(kwargs)
+        raise RuntimeError("stop after routing assertion")
+
+    monkeypatch.setattr(segment_pipeline, "generate_research_brief", research)
+
+    with pytest.raises(RuntimeError, match="stop after routing assertion"):
+        segment_pipeline._run_pipeline("db", "work", "owner", 1, "output")
+
+    assert captured["snapshot"] is snapshot
+
 
 
 def _parallel_pipeline_db(tmp_path, text: str) -> tuple[str, dict]:

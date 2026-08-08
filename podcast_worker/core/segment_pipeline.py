@@ -155,12 +155,27 @@ def _hydrate(db_path: str, work_id: str, owner: str, epoch: int) -> dict[str, An
             raise PipelineInvariantError("committed segment order is inconsistent")
         if segment["subtopic"] != section.get("topic"):
             raise PipelineInvariantError("committed segment topic is inconsistent")
+    execution = persistence._get_project_execution(db_path, work["project_id"])
+    if (
+        execution is None
+        or execution["llm_snapshot_id"] != work["llm_snapshot_id"]
+        or execution["tts_snapshot_id"] != work["tts_snapshot_id"]
+    ):
+        raise PipelineInvariantError("committed execution snapshots are inconsistent")
+    llm_snapshot = cfg.execution_snapshot_from_payload(
+        execution["llm_snapshot"], execution["llm_revision"]
+    )
+    tts_snapshot = cfg.tts_snapshot_from_payload(
+        execution["tts_snapshot"], execution["tts_revision"]
+    )
     return {
         "work": dict(work),
         "outline": outline,
         "segments": [persistence._row_to_segment(row) for row in segments],
         "interviewer_profile": json.loads(work["interviewer_profile_json"]),
         "sme_profile": json.loads(work["sme_profile_json"]),
+        "llm_snapshot": llm_snapshot,
+        "tts_snapshot": tts_snapshot,
     }
 
 
@@ -353,9 +368,9 @@ def _run_pipeline(db_path: str, work_id: str, owner: str, epoch: int, output_dir
     work = hydrated["work"]
     project_id = work["project_id"]
     outline = hydrated["outline"]
-    provider = cfg.settings.llm_provider
-    model = cfg.settings.openai_model if provider == "openai" else cfg.settings.openrouter_model
-    provider_args = {"provider": provider, "model": model}
+    llm_snapshot = hydrated["llm_snapshot"]
+    tts_snapshot = hydrated["tts_snapshot"]
+    provider_args = {"snapshot": llm_snapshot}
 
     research = _completed_result(db_path, project_id, "project", "research")
     if research is None:
@@ -428,9 +443,9 @@ def _run_pipeline(db_path: str, work_id: str, owner: str, epoch: int, output_dir
             lambda: {
                 "output": synthesize(
                     previous_text,
-                    str(speech_mp3),
-                    provider=cfg.settings.tts_provider,
-                    voice=cfg.settings.edge_tts_voice,
+                    provider=tts_snapshot.provider,
+                    output_path=str(speech_mp3),
+                    voice=tts_snapshot.voice_bindings["interviewer"],
                 ) or str(speech_mp3)
             },
         )
