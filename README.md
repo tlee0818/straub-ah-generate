@@ -21,6 +21,34 @@ SERVER_NAME=<public hostname>
 
 Non-secret LLM routes and voice defaults are committed under `podcast_worker/config/`.
 
+## Deploy to a DigitalOcean Droplet
+
+[`.github/workflows/deploy.yml`](.github/workflows/deploy.yml) builds the image, pushes the commit SHA and `latest` tags to GitHub Container Registry, then deploys the immutable SHA tag when `main` is updated. It can also be run manually with **Actions → Deploy to DigitalOcean → Run workflow**.
+
+The Droplet must have Docker installed, and the SSH user must be able to run `docker` without an interactive `sudo` password. The workflow expects the production environment file at `/opt/straub-ah/.env`, keeps generated data in the `straub-ah-data` Docker volume, and binds the API to `127.0.0.1:8100` for a reverse proxy on the Droplet.
+
+Configure these GitHub Actions environment secrets under **Settings → Environments → production → Environment secrets**:
+
+| Secret | Value |
+|---|---|
+| `DROPLET_HOST` | Droplet IP address or DNS name |
+| `DROPLET_USER` | SSH user with Docker access |
+| `DROPLET_SSH_PRIVATE_KEY` | Private half of a dedicated deployment SSH key |
+| `DROPLET_KNOWN_HOSTS` | Verified `known_hosts` line for the Droplet |
+| `DROPLET_SSH_PORT` | Optional SSH port; defaults to `22` |
+
+`GITHUB_TOKEN` is created automatically by GitHub Actions; do not add it manually. The workflow uses it to publish and pull this repository's GHCR image.
+
+Generate a dedicated key, authorize it on the Droplet, and collect the host key:
+
+```bash
+ssh-keygen -t ed25519 -C "github-actions-straub-ah" -f ./straub-ah-deploy
+ssh-copy-id -i ./straub-ah-deploy.pub <user>@<droplet-host>
+ssh-keyscan -H <droplet-host>
+```
+
+Put the contents of `straub-ah-deploy` in `DROPLET_SSH_PRIVATE_KEY`. Put the verified `ssh-keyscan` output in `DROPLET_KNOWN_HOSTS`; compare its fingerprint with `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` from the DigitalOcean web console before trusting it. Delete the local private-key copy after storing it securely.
+
 ## API
 
 Interactive Swagger UI is available at `/docs`; ReDoc is at `/redoc`. The committed OpenAPI document is [`docs/openapi.json`](docs/openapi.json). Product endpoints require:
