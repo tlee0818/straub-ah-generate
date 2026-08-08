@@ -138,6 +138,8 @@ jobs:
               --network "$network_name" \
               --network-alias api \
               --env-file "$env_file" \
+              --env PODCAST_DB_PATH=/data/podcast_worker.db \
+              --env PODCAST_OUTPUT_DIR=/data/output \
               --volume "$data_volume:/data" \
               --publish 127.0.0.1:8100:8100 \
               "$1"
@@ -169,6 +171,13 @@ jobs:
               echo "Restoring previous image: $previous_image" >&2
               run_container "$previous_image"
             fi
+            exit 1
+          fi
+
+          mounted_volume="$(docker container inspect --format '{{range .Mounts}}{{if eq .Destination "/data"}}{{.Name}}{{end}}{{end}}' "$container_name")"
+          configured_db="$(docker exec "$container_name" printenv PODCAST_DB_PATH)"
+          if [[ "$mounted_volume" != "$data_volume" || "$configured_db" != "/data/podcast_worker.db" ]]; then
+            echo "Persistent database configuration verification failed." >&2
             exit 1
           fi
 
