@@ -50,6 +50,24 @@ def test_verification_result_is_persistable_and_blocks_rejected_text():
     with pytest.raises(RoutingConfigurationError, match="validation_failed"):
         segment_pipeline._verification_payload(blocked)
 
+
+def test_accepted_malformed_rewrite_uses_canonical_draft():
+    verification = {"outcome": "accepted", "issues": [], "verified_text": "Unlabeled rewrite"}
+    result = segment_pipeline._canonical_verified_dialogue(
+        verification,
+        "Interviewer: Question\nSME: Answer",
+    )
+    assert result["verified_text"] == "Interviewer: Question\nSME: Answer"
+
+
+def test_corrected_malformed_rewrite_fails_closed():
+    verification = {"outcome": "corrected", "issues": ["fixed"], "verified_text": "Unlabeled rewrite"}
+    with pytest.raises(RoutingConfigurationError, match="invalid_dialogue_turn"):
+        segment_pipeline._canonical_verified_dialogue(
+            verification,
+            "Interviewer: Question\nSME: Answer",
+        )
+
 def test_snapshot_tts_uses_bound_provider_and_voice(monkeypatch, tmp_path):
     captured = {}
 

@@ -31,6 +31,7 @@ from podcast_worker.core.script_generator import (
 )
 from podcast_worker.core.tts_engine import (
     convert_to_wav,
+    parse_dialogue_turns,
     plan_dialogue_requests,
     synthesize,
     synthesize_elevenlabs_plan,
@@ -113,6 +114,18 @@ def _verification_payload(result) -> dict:
         "issues": list(result.issues),
         "verified_text": result.verified_text,
     }
+
+
+def _canonical_verified_dialogue(verification: dict, draft_text: str) -> dict:
+    """Keep accepted text usable while rejecting malformed corrective rewrites."""
+    try:
+        parse_dialogue_turns(verification["verified_text"])
+        return verification
+    except RoutingConfigurationError:
+        if verification.get("outcome") != "accepted":
+            raise
+        parse_dialogue_turns(draft_text)
+        return {**verification, "verified_text": draft_text}
 def _synthesize_snapshot(
     text: str,
     snapshot: cfg.ResolvedTTSSnapshot,
@@ -491,6 +504,7 @@ def _run_pipeline(db_path: str, work_id: str, owner: str, epoch: int, output_dir
                     )
                 ),
             )
+            verification = _canonical_verified_dialogue(verification, draft["text"])
             _publish_verified_text(db_path, work_id, owner, epoch, segment_id, verification)
         previous_text = verification["verified_text"]
 
