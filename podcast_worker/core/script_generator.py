@@ -88,6 +88,7 @@ def _call_openai(
     temperature: float = 0.8,
     base_url: Optional[str] = None,
     dialect: str = "openai_json_object",
+    timeout_seconds: int = 120,
 ) -> dict[str, Any]:
     """Call an OpenAI-compatible endpoint using the route's declared JSON dialect."""
     from openai import OpenAI
@@ -95,7 +96,11 @@ def _call_openai(
     key = api_key
     if not key:
         raise ValueError("API key not set for the selected OpenAI-compatible provider.")
-    client_kwargs: dict[str, Any] = {"api_key": key}
+    client_kwargs: dict[str, Any] = {
+        "api_key": key,
+        "timeout": timeout_seconds,
+        "max_retries": 0,
+    }
     if base_url:
         client_kwargs["base_url"] = base_url
     options: dict[str, Any] = {"temperature": temperature}
@@ -118,6 +123,7 @@ def _call_ollama(
     user_prompt: str,
     base_url: Optional[str] = None,
     model: Optional[str] = None,
+    timeout_seconds: int = 120,
 ) -> dict[str, Any]:
     """Call Ollama's explicitly declared JSON mode."""
     import requests
@@ -125,7 +131,7 @@ def _call_ollama(
     response = requests.post(
         f"{base_url or config.OLLAMA_BASE_URL}/api/generate",
         json={"model": model or config.OLLAMA_MODEL, "prompt": f"{system_prompt}\n\n{user_prompt}", "stream": False, "format": "json"},
-        timeout=120,
+        timeout=timeout_seconds,
     )
     response.raise_for_status()
     return _strict_json(response.json().get("response", ""), "ollama_format_json")
@@ -147,12 +153,13 @@ def _call_provider(
     selected_provider = route.provider if route else (provider or config.LLM_PROVIDER)
     selected_model = route.model if route else model
     selected_temperature = route.temperature if route else temperature
+    selected_timeout = route.timeout_seconds if route else 120
     if selected_provider == "openai":
-        return _call_openai(system_prompt, user_prompt, api_key or config.OPENAI_API_KEY, selected_model, selected_temperature, dialect=route.dialect if route else "openai_json_object")
+        return _call_openai(system_prompt, user_prompt, api_key or config.OPENAI_API_KEY, selected_model, selected_temperature, dialect=route.dialect if route else "openai_json_object", timeout_seconds=selected_timeout)
     if selected_provider == "ollama":
-        return _call_ollama(system_prompt, user_prompt, model=selected_model)
+        return _call_ollama(system_prompt, user_prompt, model=selected_model, timeout_seconds=selected_timeout)
     if selected_provider == "openrouter":
-        return _call_openai(system_prompt, user_prompt, api_key or config.OPENROUTER_API_KEY, selected_model or config.OPENROUTER_MODEL, selected_temperature, config.OPENROUTER_BASE_URL, route.dialect if route else "openrouter_legacy_prompt_strict_parse")
+        return _call_openai(system_prompt, user_prompt, api_key or config.OPENROUTER_API_KEY, selected_model or config.OPENROUTER_MODEL, selected_temperature, config.OPENROUTER_BASE_URL, route.dialect if route else "openrouter_legacy_prompt_strict_parse", timeout_seconds=selected_timeout)
     raise RoutingConfigurationError("unknown_llm_provider")
 
 
