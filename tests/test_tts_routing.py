@@ -130,6 +130,8 @@ class TestElevenLabsExecution:
             {"text": "Hello.", "voice_id": "eleven-host"},
             {"text": "Welcome.", "voice_id": "eleven-guest"},
         ]
+        assert "output_format" not in calls[0][1]["json"]
+        assert calls[0][1]["params"] == {"output_format": "mp3_44100_128"}
         assert calls[0][1]["headers"]["X-Request-Id"] == plan.plan_id
 
     def test_ambiguous_provider_outcome_is_not_blindly_retried(self, monkeypatch, tmp_path):

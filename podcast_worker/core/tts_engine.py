@@ -172,7 +172,6 @@ def synthesize_elevenlabs_plan(plan: TTSRequestPlan, snapshot: ResolvedTTSSnapsh
         payload: dict[str, Any] = {
             "model_id": "eleven_v3",
             "inputs": [{"text": turn.text, "voice_id": snapshot.voice_bindings[turn.role]} for turn in plan.turns],
-            "output_format": snapshot.output_format,
         }
         endpoint = "https://api.elevenlabs.io/v1/text-to-dialogue"
     else:
@@ -183,6 +182,7 @@ def synthesize_elevenlabs_plan(plan: TTSRequestPlan, snapshot: ResolvedTTSSnapsh
         response = requests.post(
             endpoint,
             json=payload,
+            params={"output_format": snapshot.output_format},
             headers={
                 "xi-api-key": config.settings.elevenlabs_api_key,
                 "accept": "audio/mpeg",
