@@ -529,6 +529,16 @@ def _create_progress_project(
     try:
         conn.execute("BEGIN IMMEDIATE")
         if outline_preview_id is not None:
+            llm_snapshot = conn.execute(
+                "SELECT profile_id FROM execution_snapshots WHERE snapshot_id=? AND snapshot_type='llm'",
+                (llm_snapshot_id,),
+            ).fetchone()
+            tts_snapshot = conn.execute(
+                "SELECT profile_id FROM execution_snapshots WHERE snapshot_id=? AND snapshot_type='tts'",
+                (tts_snapshot_id,),
+            ).fetchone()
+            if llm_snapshot is None or tts_snapshot is None:
+                raise ValueError("preview_binding_not_found")
             binding = conn.execute(
                 "SELECT * FROM outline_preview_bindings WHERE outline_preview_id=? AND owner_id=?",
                 (outline_preview_id, owner_id),
@@ -545,8 +555,20 @@ def _create_progress_project(
                 or binding["duration_minutes"] != duration_minutes
                 or binding["planned_segment_count"] != expected_count
                 or binding["outline_hash"] != hashlib.sha256(outline_json.encode()).hexdigest()
-                or binding["llm_profile_id"] != llm_snapshot_id
-                or binding["tts_profile_id"] != tts_snapshot_id
+                or binding["llm_profile_id"] != llm_snapshot["profile_id"]
+                or binding["tts_profile_id"] != tts_snapshot["profile_id"]
+            ):
+                raise ValueError("preview_binding_mismatch")
+            durable_binding = conn.execute(
+                "SELECT * FROM outline_previews WHERE outline_preview_id=? AND owner_id=?",
+                (outline_preview_id, owner_id),
+            ).fetchone()
+            if (
+                durable_binding is None
+                or durable_binding["consumed_at"] is not None
+                or durable_binding["expires_at"] <= now
+                or durable_binding["llm_snapshot_id"] != llm_snapshot_id
+                or durable_binding["tts_snapshot_id"] != tts_snapshot_id
             ):
                 raise ValueError("preview_binding_mismatch")
             consumed = conn.execute(
@@ -564,6 +586,15 @@ def _create_progress_project(
             ) VALUES (?, ?, ?, ?, ?, 'queued', ?, ?)""",
             (project_id, owner_id, topic, bpm, duration_minutes, now, now),
         )
+        if outline_preview_id is not None:
+            conn.execute(
+                "UPDATE outline_previews SET consumed_at=?, project_id=? WHERE outline_preview_id=?",
+                (now, project_id, outline_preview_id),
+            )
+            conn.execute(
+                "UPDATE episode_ledgers SET project_id=? WHERE ledger_id=?",
+                (project_id, durable_binding["ledger_id"]),
+            )
         for segment_id, section in segment_rows:
             conn.execute(
                 """INSERT INTO segments (

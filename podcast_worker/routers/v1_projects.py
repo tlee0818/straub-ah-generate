@@ -87,6 +87,18 @@ def _tts_snapshot_payload(snapshot) -> dict:
         "budget": {"mode": snapshot.budget.mode, "currency": snapshot.budget.currency,
                    "caps": dict(snapshot.budget.caps), "pricing": dict(snapshot.budget.pricing)},
     }
+def _snapshot_record(snapshot, payload: dict, prefix: str) -> dict:
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    digest = hashlib.sha256(canonical.encode()).hexdigest()
+    return {
+        "snapshot_id": f"{prefix}_{digest[:20]}",
+        "profile_id": snapshot.profile_id,
+        "revision": snapshot.revision,
+        "payload": payload,
+        "sha256": digest,
+    }
+
+
 
 def _short_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:12]}"
@@ -183,6 +195,7 @@ async def preview_project_outline(
     """Generate and persist a one-time reviewable outline binding."""
     llm_snapshot = resolve_llm_profile(req.llm_profile_id)
     tts_snapshot = resolve_tts_profile(req.tts_profile_id)
+    validate_profile_pair(llm_snapshot, tts_snapshot)
     provider = llm_snapshot.route_for("outline").provider
     model = llm_snapshot.route_for("outline").model
     outline = generate_script_outline(
@@ -206,6 +219,35 @@ async def preview_project_outline(
         llm_snapshot.revision,
         tts_snapshot.revision,
         (datetime.now(timezone.utc) + timedelta(minutes=15)).isoformat(),
+    )
+    llm_payload = _llm_snapshot_payload(llm_snapshot)
+    tts_payload = _tts_snapshot_payload(tts_snapshot)
+    persistence._create_preview_binding(
+        _db_path(),
+        {
+            "outline_preview_id": binding["outline_preview_id"],
+            "owner_id": owner_id,
+            "topic": req.topic,
+            "bpm": req.bpm,
+            "duration_minutes": req.duration_minutes,
+            "outline": _outline_response_to_generator(response_outline),
+            "llm_profile_id": llm_snapshot.profile_id,
+            "tts_profile_id": tts_snapshot.profile_id,
+            "routing_revision": llm_snapshot.revision,
+            "tts_routing_revision": tts_snapshot.revision,
+            "expires_at": binding["expires_at"],
+        },
+        _snapshot_record(llm_snapshot, llm_payload, "lsn"),
+        _snapshot_record(tts_snapshot, tts_payload, "tsn"),
+        {
+            "ledger_id": _short_id("led"),
+            "policy": {
+                "mode": llm_snapshot.budget.mode,
+                "caps": dict(llm_snapshot.budget.caps),
+                "pricing": dict(llm_snapshot.budget.pricing),
+            },
+            "currency": llm_snapshot.budget.currency,
+        },
     )
     return OutlinePreviewResponse(
         **response_outline.model_dump(),
@@ -249,6 +291,19 @@ async def create_project(
     sme_profile = req.sme_profile.model_dump(exclude_none=True) if req.sme_profile else None
     llm_snapshot = resolve_llm_profile(req.llm_profile_id)
     tts_snapshot = resolve_tts_profile(req.tts_profile_id)
+    validate_profile_pair(llm_snapshot, tts_snapshot)
+    persisted_preview = persistence._get_preview_binding(db, outline_preview_id, owner_id)
+    if persisted_preview is None:
+        _generation_slots.release()
+        raise HTTPException(
+            status_code=409,
+            detail=ErrorEnvelope(
+                error=ErrorResponse(
+                    code="preview_binding_not_found",
+                    message="The persisted execution binding is unavailable.",
+                )
+            ).model_dump(),
+        )
     try:
         project = await persistence.create_progress_project(
             db,
@@ -260,8 +315,8 @@ async def create_project(
             outline,
             interviewer_profile,
             sme_profile,
-            llm_snapshot.profile_id,
-            tts_snapshot.profile_id,
+            persisted_preview["llm_snapshot_id"],
+            persisted_preview["tts_snapshot_id"],
             outline_preview_id,
         )
     except ValueError as exc:
