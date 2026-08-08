@@ -100,12 +100,20 @@ def test_provider_crash_fails_unknown_and_cannot_replay_after_restart(tmp_path):
     generation = connection.execute(
         "SELECT disposition, terminal_outcome FROM project_generation WHERE project_id='prj_provider'"
     ).fetchone()
+    project_error = connection.execute(
+        "SELECT code, message, retryable FROM project_errors WHERE project_id='prj_provider'"
+    ).fetchone()
     connection.close()
 
     assert dict(attempt) == {"state": "failed_unknown"}
     assert dict(stage) == {"state": "failed", "safe_error_code": "provider_outcome_unknown"}
     assert pipeline["state"] == "failed"
     assert dict(generation) == {"disposition": "terminal", "terminal_outcome": "failed"}
+    assert dict(project_error) == {
+        "code": "generation_failed",
+        "message": "Generation could not safely continue",
+        "retryable": 0,
+    }
     assert persistence._claim_next_work(db_path, "worker-restarted") is None
     with pytest.raises(FenceLost):
         _provider_operation(*args)

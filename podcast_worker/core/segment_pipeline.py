@@ -87,9 +87,15 @@ def _provider_operation(
         raise FenceLost("provider dispatch fence rejected")
     try:
         result = operation()
-    except Exception:
+    except Exception as exc:
         persistence._fail_dispatched_attempt_unknown(
             db_path, attempt["attempt_id"], work_id, owner, epoch
+        )
+        persistence._add_project_error(
+            db_path,
+            attempt["project_id"],
+            _public_error_code(exc),
+            "Generation could not safely continue",
         )
         raise
     if not isinstance(result, dict):
