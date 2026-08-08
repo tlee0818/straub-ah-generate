@@ -45,9 +45,9 @@ def _call_openai(
     """Call an OpenAI-compatible endpoint using the route's declared JSON dialect."""
     from openai import OpenAI
 
-    key = api_key or config.OPENAI_API_KEY
-    if not key and not base_url:
-        raise ValueError("OpenAI API key not set. Set PODCAST_OPENAI_API_KEY env var or pass api_key.")
+    key = api_key
+    if not key:
+        raise ValueError("API key not set for the selected OpenAI-compatible provider.")
     client_kwargs: dict[str, Any] = {"api_key": key}
     if base_url:
         client_kwargs["base_url"] = base_url
@@ -101,11 +101,11 @@ def _call_provider(
     selected_model = route.model if route else model
     selected_temperature = route.temperature if route else temperature
     if selected_provider == "openai":
-        return _call_openai(system_prompt, user_prompt, api_key, selected_model, selected_temperature, dialect=route.dialect if route else "openai_json_object")
+        return _call_openai(system_prompt, user_prompt, api_key or config.OPENAI_API_KEY, selected_model, selected_temperature, dialect=route.dialect if route else "openai_json_object")
     if selected_provider == "ollama":
         return _call_ollama(system_prompt, user_prompt, model=selected_model)
     if selected_provider == "openrouter":
-        return _call_openai(system_prompt, user_prompt, api_key, selected_model or config.OPENROUTER_MODEL, selected_temperature, config.OPENROUTER_BASE_URL, route.dialect if route else "openrouter_legacy_prompt_strict_parse")
+        return _call_openai(system_prompt, user_prompt, api_key or config.OPENROUTER_API_KEY, selected_model or config.OPENROUTER_MODEL, selected_temperature, config.OPENROUTER_BASE_URL, route.dialect if route else "openrouter_legacy_prompt_strict_parse")
     raise RoutingConfigurationError("unknown_llm_provider")
 
 

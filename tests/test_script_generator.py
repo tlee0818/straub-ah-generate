@@ -35,6 +35,39 @@ SAMPLE_SCRIPT = {
 }
 
 
+class TestProviderRouting:
+    def test_openrouter_uses_openrouter_api_key(self, monkeypatch):
+        calls = []
+
+        monkeypatch.setattr(script_generator.config, "OPENROUTER_API_KEY", "openrouter-secret")
+        monkeypatch.setattr(script_generator.config, "OPENAI_API_KEY", "")
+        monkeypatch.setattr(
+            script_generator,
+            "_call_openai",
+            lambda *args, **kwargs: calls.append((args, kwargs)) or {"ok": True},
+        )
+
+        result = script_generator._call_provider("system", "user", provider="openrouter")
+
+        assert result == {"ok": True}
+        assert calls[0][0][2] == "openrouter-secret"
+        assert calls[0][0][5] == script_generator.config.OPENROUTER_BASE_URL
+
+    def test_openai_uses_openai_api_key(self, monkeypatch):
+        calls = []
+
+        monkeypatch.setattr(script_generator.config, "OPENAI_API_KEY", "openai-secret")
+        monkeypatch.setattr(
+            script_generator,
+            "_call_openai",
+            lambda *args, **kwargs: calls.append((args, kwargs)) or {"ok": True},
+        )
+
+        script_generator._call_provider("system", "user", provider="openai")
+
+        assert calls[0][0][2] == "openai-secret"
+
+
 class TestFlattenScript:
     def test_flatten_basic(self):
         text = flatten_script(SAMPLE_SCRIPT)
