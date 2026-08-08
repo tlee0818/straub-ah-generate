@@ -11,10 +11,10 @@
     {
       "id": "studio-dialogue",
       "label": "Studio dialogue",
-      "description": "Natural two-speaker ElevenLabs v3 dialogue.",
+      "description": "Natural two-speaker ElevenLabs dialogue rendered with broadly available text-to-speech.",
       "provider": "elevenlabs",
-      "strategy": "text_to_dialogue_v3",
-      "model_id": "eleven_v3",
+      "strategy": "stitched_text_to_speech",
+      "model_id": "eleven_multilingual_v2",
       "output_format": "mp3_44100_128",
       "default_interviewer_voice_id": "interviewer-rachel",
       "default_guest_voice_id": "guest-adam",
@@ -24,9 +24,9 @@
         "guest-adam": {"provider_voice_id": "pNInz6obpgDQGcFmaJgB"},
         "guest-josh": {"provider_voice_id": "TxGEqnHWrfWFTfGW9XjX"}
       },
-      "max_scene_characters": 1800,
-      "max_scene_turns": 10,
-      "max_fragment_characters": 0,
+      "max_scene_characters": 0,
+      "max_scene_turns": 0,
+      "max_fragment_characters": 1800,
       "max_attempts": 2,
       "max_concurrent_requests": 4
     }
