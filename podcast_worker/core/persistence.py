@@ -1698,6 +1698,7 @@ def _row_to_provenance(row: sqlite3.Row) -> dict | None:
 def _row_to_artifact(row: sqlite3.Row) -> dict:
     return {
         "artifact_id": row["artifact_id"],
+        "project_id": row["project_id"],
         "kind": row["kind"],
         "segment_id": row["segment_id"],
         "content_type": row["content_type"],
