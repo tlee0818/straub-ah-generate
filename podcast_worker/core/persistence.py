@@ -715,7 +715,7 @@ def _get_generation_progress(conn: sqlite3.Connection, project_id: str) -> dict 
             state = "failed"
         elif rows and completed == len(rows):
             state = "completed"
-        elif "running" in states:
+        elif "running" in states or completed > 0:
             state = "running"
         else:
             state = "pending"
