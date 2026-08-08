@@ -6,9 +6,14 @@ Supports: edge-tts (free, no API key) and OpenAI TTS.
 import asyncio
 import os
 import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+import re
+from typing import Any, Literal
 from typing import Optional
 
 from . import config
+from .config import ResolvedTTSSnapshot, RoutingConfigurationError
 
 
 def _temporary_path(suffix: str) -> str:
@@ -37,6 +42,146 @@ def _split_into_chunks(text: str, max_chars: int = 3000) -> list:
         chunks.append(current.strip())
 
     return chunks if chunks else [text]
+@dataclass(frozen=True)
+class DialogueTurn:
+    role: Literal["interviewer", "guest"]
+    text: str
+
+
+@dataclass(frozen=True)
+class TTSRequestPlan:
+    plan_id: str
+    strategy: str
+    turns: tuple[DialogueTurn, ...]
+    voice_binding: str | None = None
+
+
+def parse_dialogue_turns(text: str) -> tuple[DialogueTurn, ...]:
+    """Accept only canonical interviewer/SME dialogue before any remote TTS call."""
+    turns: list[DialogueTurn] = []
+    role: str | None = None
+    lines: list[str] = []
+    for line in text.splitlines():
+        match = re.match(r"^(Interviewer|SME):\s*(.+)$", line.strip())
+        if match:
+            if role is not None:
+                content = " ".join(lines).strip()
+                if not content:
+                    raise RoutingConfigurationError("invalid_dialogue_turn")
+                turns.append(DialogueTurn(role, content))
+            role = "interviewer" if match.group(1) == "Interviewer" else "guest"
+            lines = [match.group(2)]
+        elif role is None or not line.strip():
+            if line.strip():
+                raise RoutingConfigurationError("invalid_dialogue_turn")
+        else:
+            lines.append(line.strip())
+    if role is None:
+        raise RoutingConfigurationError("invalid_dialogue_turn")
+    content = " ".join(lines).strip()
+    if not content:
+        raise RoutingConfigurationError("invalid_dialogue_turn")
+    turns.append(DialogueTurn(role, content))
+    return tuple(turns)
+
+
+def plan_dialogue_requests(text: str, snapshot: ResolvedTTSSnapshot) -> tuple[TTSRequestPlan, ...]:
+    """Create deterministic, strategy-specific request boundaries from an immutable snapshot."""
+    turns = parse_dialogue_turns(text)
+    if snapshot.strategy == "text_to_dialogue_v3":
+        plans: list[TTSRequestPlan] = []
+        current: list[DialogueTurn] = []
+        char_count = 0
+        for turn in turns:
+            if len(turn.text) > snapshot.max_scene_characters:
+                raise RoutingConfigurationError("tts_turn_too_long")
+            exceeds = current and (len(current) >= snapshot.max_scene_turns or char_count + len(turn.text) > snapshot.max_scene_characters)
+            if exceeds:
+                plans.append(TTSRequestPlan(f"scene-{len(plans)}", snapshot.strategy, tuple(current)))
+                current, char_count = [], 0
+            current.append(turn)
+            char_count += len(turn.text)
+        if current:
+            plans.append(TTSRequestPlan(f"scene-{len(plans)}", snapshot.strategy, tuple(current)))
+        return tuple(plans)
+    if snapshot.strategy != "stitched_text_to_speech":
+        raise RoutingConfigurationError("unsupported_tts_strategy")
+    plans = []
+    for turn in turns:
+        for fragment in _split_dialogue_fragment(turn.text, snapshot.max_fragment_characters):
+            plans.append(TTSRequestPlan(f"fragment-{len(plans)}", snapshot.strategy, (DialogueTurn(turn.role, fragment),), snapshot.voice_bindings[turn.role]))
+    return tuple(plans)
+
+
+def _split_dialogue_fragment(text: str, maximum: int) -> tuple[str, ...]:
+    if maximum < 1:
+        raise RoutingConfigurationError("invalid_fragment_limit")
+    fragments: list[str] = []
+    remaining = text.strip()
+    while len(remaining) > maximum:
+        boundary = max(remaining.rfind(mark, 0, maximum + 1) for mark in ".!?")
+        if boundary < 0:
+            boundary = remaining.rfind(" ", 0, maximum + 1)
+        if boundary <= 0:
+            raise RoutingConfigurationError("tts_unsplittable_token")
+        fragments.append(remaining[:boundary + 1].strip())
+        remaining = remaining[boundary + 1:].strip()
+    if remaining:
+        fragments.append(remaining)
+    return tuple(fragments)
+
+
+def classify_tts_failure(status_code: int | None, dispatched: bool) -> Literal["retry", "terminal", "unknown_outcome"]:
+    """Only failures proven not accepted remotely may be retried automatically."""
+    if not dispatched:
+        return "terminal"
+    if status_code in {429, 500, 503}:
+        return "retry"
+    if status_code is not None and 400 <= status_code < 500:
+        return "terminal"
+    return "unknown_outcome"
+
+
+def synthesize_elevenlabs_plan(plan: TTSRequestPlan, snapshot: ResolvedTTSSnapshot, output_path: str) -> str:
+    """Execute one planned ElevenLabs request. Ambiguous failures are never replayed here."""
+    if snapshot.provider != "elevenlabs" or not config.settings.elevenlabs_api_key:
+        raise RoutingConfigurationError("invalid_elevenlabs_configuration")
+    import requests
+
+    destination = Path(output_path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    staging = destination.parent / ".staging" / f"{destination.name}.part"
+    staging.parent.mkdir(parents=True, exist_ok=True)
+    if plan.strategy == "text_to_dialogue_v3":
+        payload: dict[str, Any] = {
+            "model_id": "eleven_v3",
+            "inputs": [{"text": turn.text, "voice_id": snapshot.voice_bindings[turn.role]} for turn in plan.turns],
+            "output_format": snapshot.output_format,
+        }
+        endpoint = "https://api.elevenlabs.io/v1/text-to-dialogue"
+    else:
+        turn = plan.turns[0]
+        payload = {"text": turn.text, "model_id": snapshot.model_id, "voice_settings": {}}
+        endpoint = f"https://api.elevenlabs.io/v1/text-to-speech/{plan.voice_binding}"
+    try:
+        response = requests.post(endpoint, json=payload, headers={"xi-api-key": config.settings.elevenlabs_api_key, "accept": "audio/mpeg"}, timeout=120, stream=True)
+    except requests.RequestException as exc:
+        raise RoutingConfigurationError("tts_outcome_unknown") from exc
+    if not response.ok:
+        action = classify_tts_failure(response.status_code, dispatched=True)
+        raise RoutingConfigurationError(f"tts_{action}")
+    with staging.open("wb") as stream:
+        for chunk in response.iter_content(65536):
+            if not chunk:
+                continue
+            stream.write(chunk)
+        stream.flush()
+        os.fsync(stream.fileno())
+    if staging.stat().st_size == 0:
+        raise RoutingConfigurationError("tts_outcome_unknown")
+    os.replace(staging, destination)
+    return str(destination)
+
 
 
 def synthesize_edge(text: str, voice: Optional[str] = None, output_path: Optional[str] = None) -> str:

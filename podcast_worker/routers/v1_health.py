@@ -6,15 +6,25 @@ GET /api/v1/config — safe client profiles (auth optional, no secrets)
 
 from __future__ import annotations
 
+import json
 import time
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 
-from podcast_worker.core.auth import optional_auth
-from podcast_worker.core.config import settings
+from podcast_worker.core.auth import optional_auth, require_auth
+from podcast_worker.core.config import (
+    RoutingConfigurationError,
+    llm_profile_document,
+    resolve_llm_profile,
+    resolve_tts_profile,
+    tts_profile_document,
+    settings,
+)
 from podcast_worker.core.models_v1 import (
     ConfigResponse,
     HealthResponse,
+    LLMProfileSummary,
+    TTSProfileSummary,
     VoiceProfile,
 )
 
@@ -34,27 +44,36 @@ async def health(owner_id: str | None = Depends(optional_auth)):
 
 
 @router.get("/config", response_model=ConfigResponse)
-async def get_config(owner_id: str | None = Depends(optional_auth)):
-    """Return server-enabled generation options safe for client display."""
-    # Build profiles from server config — never expose secrets
+async def get_config(owner_id: str = Depends(require_auth)):
+    """Return authenticated safe summaries derived from server-owned profile configuration."""
+    try:
+        default_llm = resolve_llm_profile()
+        default_tts = resolve_tts_profile()
+    except RoutingConfigurationError as exc:
+        raise HTTPException(status_code=503, detail={"error": {"code": str(exc)}}) from exc
+    llm_source = llm_profile_document()
+    tts_source = tts_profile_document()
     llm_profiles = [
-        VoiceProfile(id="default", label="Default script generator"),
+        {"id": item["id"], "label": item.get("label", item["id"]), "description": item.get("description")}
+        for item in llm_source.get("profiles", [])
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
     ]
-
     tts_profiles = [
-        VoiceProfile(id="default", label="Default voice"),
+        {"id": item["id"], "label": item.get("label", item["id"]), "description": item.get("description")}
+        for item in tts_source.get("profiles", [])
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
     ]
-
     voices = [
-        VoiceProfile(id=settings.edge_tts_voice, label=f"{settings.edge_tts_voice} — Edge TTS"),
-        VoiceProfile(id=settings.openai_tts_voice, label=f"{settings.openai_tts_voice} — OpenAI TTS"),
-        VoiceProfile(id=settings.openrouter_tts_voice, label=f"{settings.openrouter_tts_voice} — OpenRouter TTS"),
+        {"id": item["id"], "label": item.get("label", item["id"]), "roles": item.get("roles", [])}
+        for item in tts_source.get("voices", [])
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
     ]
-
     return ConfigResponse(
-        llm_profiles=llm_profiles,
-        tts_profiles=tts_profiles,
-        voices=voices,
+        llm_profiles=[LLMProfileSummary(**item) for item in llm_profiles],
+        tts_profiles=[TTSProfileSummary(**item) for item in tts_profiles],
+        voices=[VoiceProfile(**item) for item in voices],
+        default_llm_profile_id=default_llm.profile_id,
+        default_tts_profile_id=default_tts.profile_id,
         bpm_range={"min": settings.min_bpm, "max": settings.max_bpm},
         duration_minutes_range={"min": 1, "max": 30},
     )

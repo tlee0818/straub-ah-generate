@@ -1,4 +1,8 @@
-# Script Generator - Dependencies
+# Podcast Worker - Core Dependencies
 openai>=1.0.0
 requests>=2.31.0
 click>=8.0.0
+numpy>=1.26.0
+pydub>=0.25.1
+edge-tts>=6.1.0
+elevenlabs>=2.0.0

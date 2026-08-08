@@ -8,20 +8,30 @@ DELETE /api/v1/projects/{id}    — Delete project and artifacts
 
 from __future__ import annotations
 
+import hashlib
+import json
 import threading
 import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
 
 from podcast_worker.core import persistence
 from podcast_worker.core.auth import require_auth
-from podcast_worker.core.config import settings
+from podcast_worker.core.config import (
+    RoutingConfigurationError,
+    resolve_llm_profile,
+    resolve_tts_profile,
+    settings,
+    validate_profile_pair,
+)
 from podcast_worker.core.script_generator import generate_script_outline
 from podcast_worker.core.models_v1 import (
     ErrorEnvelope,
     ErrorResponse,
     PodcastProjectResponse,
+    OutlinePreviewResponse,
     OutlinePreviewRequest,
     ProjectCreateRequest,
     ProjectCreateResponse,
@@ -48,15 +58,39 @@ def _output_dir() -> str:
     return str(project_root / configured)
 
 
+def _routing_error(exc: RoutingConfigurationError, pair: bool = False) -> HTTPException:
+    code = "incompatible_generation_profiles" if pair else str(exc)
+    return HTTPException(status_code=422, detail=ErrorEnvelope(error=ErrorResponse(
+        code=code, message="The selected generation profile is unavailable or incompatible."
+    )).model_dump())
+
+
+def _llm_snapshot_payload(snapshot) -> dict:
+    return json.loads(snapshot.canonical_json())
+
+
+def _tts_snapshot_payload(snapshot) -> dict:
+    return {
+        "profile_id": snapshot.profile_id, "revision": snapshot.revision,
+        "provider": snapshot.provider, "strategy": snapshot.strategy, "model_id": snapshot.model_id,
+        "output_format": snapshot.output_format, "max_scene_characters": snapshot.max_scene_characters,
+        "max_scene_turns": snapshot.max_scene_turns, "max_fragment_characters": snapshot.max_fragment_characters,
+        "voice_bindings": dict(snapshot.voice_bindings), "max_attempts": snapshot.max_attempts,
+        "context_max_request_ids": snapshot.context_max_request_ids,
+        "context_max_age_seconds": snapshot.context_max_age_seconds,
+        "continuity_after_expiry": snapshot.continuity_after_expiry,
+        "max_concurrent_requests": snapshot.max_concurrent_requests,
+    }
+
 def _short_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:12]}"
 
 
-def _run_project_pipeline_with_slot(*args) -> None:
+def _run_project_pipeline_with_slot(slot, *args) -> None:
     try:
         run_project_pipeline(*args)
     finally:
-        _generation_slots.release()
+        slot.release()
 
 
 def _project_not_found(project_id: str) -> HTTPException:
@@ -125,23 +159,49 @@ def _outline_response_to_generator(outline: ProjectOutlineResponse | None) -> di
 # POST /api/v1/projects
 # ═══════════════════════════════════════════════════════════════════════════
 
-@router.post("/outline-preview", response_model=ProjectOutlineResponse)
+@router.post("/outline-preview", response_model=OutlinePreviewResponse)
 async def preview_project_outline(
     req: OutlinePreviewRequest,
     owner_id: str = Depends(require_auth),
 ):
-    """Generate a reviewable script outline before starting full project generation."""
-    del owner_id
-    provider = settings.llm_provider
-    model = settings.openai_model if provider == "openai" else settings.openrouter_model
+    """Generate a reviewable outline with a durable paired safe-profile binding."""
+    try:
+        llm = resolve_llm_profile(req.llm_profile_id)
+        tts = resolve_tts_profile(req.tts_profile_id)
+        validate_profile_pair(llm, tts)
+    except RoutingConfigurationError as exc:
+        raise _routing_error(exc, str(exc) == "incompatible_generation_profiles") from exc
+    llm_profile_id, tts_profile_id = llm.profile_id, tts.profile_id
     outline = generate_script_outline(
         topic=req.topic,
         bpm=req.bpm,
         duration_minutes=req.duration_minutes,
-        provider=provider,
-        model=model,
+        snapshot=llm,
     )
-    return _outline_response_from_generator(req.topic, outline)
+    response = _outline_response_from_generator(req.topic, outline)
+    preview_id = _short_id("opv")
+    routing_revision, tts_routing_revision = llm.revision, tts.revision
+    llm_payload, tts_payload = _llm_snapshot_payload(llm), _tts_snapshot_payload(tts)
+    llm_snapshot = {"snapshot_id": _short_id("lsn"), "profile_id": llm_profile_id,
+                    "revision": routing_revision, "payload": llm_payload,
+                    "sha256": hashlib.sha256(json.dumps(llm_payload, sort_keys=True).encode()).hexdigest()}
+    tts_snapshot = {"snapshot_id": _short_id("tsn"), "profile_id": tts_profile_id,
+                    "revision": tts_routing_revision, "payload": tts_payload,
+                    "sha256": hashlib.sha256(json.dumps(tts_payload, sort_keys=True).encode()).hexdigest()}
+    expires_at = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
+    await persistence.create_preview_binding(_db_path(), {
+        "outline_preview_id": preview_id, "owner_id": owner_id, "topic": req.topic, "bpm": req.bpm,
+        "duration_minutes": req.duration_minutes, "outline": response.model_dump(),
+        "llm_profile_id": llm_profile_id, "tts_profile_id": tts_profile_id,
+        "routing_revision": routing_revision, "tts_routing_revision": tts_routing_revision,
+        "expires_at": expires_at,
+    }, llm_snapshot, tts_snapshot, {
+        "ledger_id": _short_id("led"), "policy": {"enforcement": "off"}, "currency": None,
+    })
+    return OutlinePreviewResponse(**response.model_dump(), outline_preview_id=preview_id,
+                                  llm_profile_id=llm_profile_id, tts_profile_id=tts_profile_id,
+                                  routing_revision=routing_revision,
+                                  tts_routing_revision=tts_routing_revision, expires_at=expires_at)
 
 
 
@@ -151,22 +211,79 @@ async def create_project(
     owner_id: str = Depends(require_auth),
 ):
     """Create a durable PodcastProject and start backend generation."""
+    interviewer_voice_id = req.interviewer_profile.voice_id if req.interviewer_profile else None
+    guest_voice_id = req.sme_profile.voice_id if req.sme_profile else None
+    try:
+        llm = resolve_llm_profile(req.llm_profile_id)
+        tts = resolve_tts_profile(req.tts_profile_id, interviewer_voice_id, guest_voice_id)
+        validate_profile_pair(llm, tts)
+    except RoutingConfigurationError as exc:
+        raise _routing_error(exc, str(exc) == "incompatible_generation_profiles") from exc
+    llm_profile_id, tts_profile_id = llm.profile_id, tts.profile_id
+    routing_revision, tts_routing_revision = llm.revision, tts.revision
+    preview = None
+    if req.outline_preview_id:
+        preview = await persistence.get_preview_binding(_db_path(), req.outline_preview_id, owner_id)
+        if preview is None or preview.get("consumed_at") is not None or preview.get("expires_at", "") <= datetime.now(timezone.utc).isoformat():
+            raise HTTPException(status_code=409, detail=ErrorEnvelope(error=ErrorResponse(
+                code="preview_expired" if preview else "preview_not_found",
+                message="The outline preview is no longer available."
+            )).model_dump())
+        if not preview.get("tts_snapshot_id"):
+            raise HTTPException(status_code=409, detail=ErrorEnvelope(error=ErrorResponse(
+                code="preview_binding_required", message="This outline preview must be regenerated."
+            )).model_dump())
+        if (preview["llm_profile_id"], preview["tts_profile_id"], preview["routing_revision"],
+            preview["tts_routing_revision"]) != (llm_profile_id, tts_profile_id,
+                                                  routing_revision, tts_routing_revision):
+            raise HTTPException(status_code=409, detail=ErrorEnvelope(error=ErrorResponse(
+                code="preview_profile_mismatch", message="The selected generation profile differs from the preview."
+            )).model_dump())
     project_id = _short_id("prj")
     db = _db_path()
     if not _generation_slots.acquire(blocking=False):
         raise HTTPException(status_code=503, detail="Generation capacity is full.")
-
-    project = await persistence.create_project(
-        db, project_id, owner_id, req.topic, req.bpm, req.duration_minutes,
-    )
+    project = await persistence.create_project(db, project_id, owner_id, req.topic, req.bpm, req.duration_minutes)
+    if preview:
+        result = await persistence.consume_preview_binding(
+            db, req.outline_preview_id, owner_id, project_id, llm_profile_id, tts_profile_id,
+            routing_revision, tts_routing_revision,
+        )
+        if result != "ok":
+            await persistence.delete_project(db, project_id)
+            _generation_slots.release()
+            raise HTTPException(status_code=409, detail=ErrorEnvelope(error=ErrorResponse(
+                code=result, message="The outline preview could not be consumed."
+            )).model_dump())
+    if preview:
+        ledger_id = preview["ledger_id"]
+    else:
+        llm_payload, tts_payload = _llm_snapshot_payload(llm), _tts_snapshot_payload(tts)
+        llm_snapshot = {"snapshot_id": _short_id("lsn"), "profile_id": llm_profile_id,
+                        "revision": routing_revision, "payload": llm_payload,
+                        "sha256": hashlib.sha256(json.dumps(llm_payload, sort_keys=True).encode()).hexdigest()}
+        tts_snapshot = {"snapshot_id": _short_id("tsn"), "profile_id": tts_profile_id,
+                        "revision": tts_routing_revision, "payload": tts_payload,
+                        "sha256": hashlib.sha256(json.dumps(tts_payload, sort_keys=True).encode()).hexdigest()}
+        ledger_id = _short_id("led")
+        await persistence.create_project_execution(db, project_id, owner_id, llm_snapshot, tts_snapshot, {
+            "ledger_id": ledger_id, "policy": {"enforcement": "off"}, "currency": None,
+        })
+    await persistence.upsert_durable_record(db, "work_items", {
+        "work_id": _short_id("wrk"), "project_id": project_id, "ledger_id": ledger_id,
+        "kind": "project_pipeline", "state": "pending",
+        "payload_json": {"llm_profile_id": llm_profile_id, "tts_profile_id": tts_profile_id,
+                         "routing_revision": routing_revision, "tts_routing_revision": tts_routing_revision},
+    })
 
     # Start background segment generation in a daemon thread
     outline = _outline_response_to_generator(req.approved_outline)
     interviewer_profile = req.interviewer_profile.model_dump(exclude_none=True) if req.interviewer_profile else None
     sme_profile = req.sme_profile.model_dump(exclude_none=True) if req.sme_profile else None
+    slot = _generation_slots
     thread = threading.Thread(
         target=_run_project_pipeline_with_slot,
-        args=(db, project_id, _output_dir(), req.topic,
+        args=(slot, db, project_id, _output_dir(), req.topic,
               req.bpm, req.duration_minutes, req.voice_id, outline,
               interviewer_profile, sme_profile),
         daemon=True,

@@ -14,26 +14,30 @@ SAMPLE_RATE = config.SAMPLE_RATE
 
 def _load_wav_to_numpy(filepath: str) -> np.ndarray:
     import wave
-    with wave.open(filepath, "r") as wf:
-        frames = wf.readframes(wf.getnframes())
-        samples = np.frombuffer(frames, dtype=np.int16).astype(np.float32) / 32767.0
-    if wf.getnchannels() == 2:
-        samples = samples.reshape(-1, 2).mean(axis=1)
-    return samples
+    with wave.open(filepath, "rb") as wf:
+        if wf.getsampwidth() != 2 or wf.getframerate() != SAMPLE_RATE:
+            raise ValueError("unsupported_pcm_format")
+        channels = wf.getnchannels()
+        if channels not in {1, 2}:
+            raise ValueError("unsupported_pcm_channels")
+        samples = np.frombuffer(wf.readframes(wf.getnframes()), dtype=np.int16).astype(np.float32) / 32767.0
+    return samples.reshape(-1, channels).mean(axis=1) if channels == 2 else samples
 
 
 def _save_numpy_to_wav(samples: np.ndarray, filepath: str):
     import wave
-    max_val = np.max(np.abs(samples))
-    if max_val > 1.0:
-        samples = samples / max_val * 0.98
-    samples_int16 = (samples * 32767).astype(np.int16)
+    if not len(samples):
+        raise ValueError("empty_audio")
+    peak = np.max(np.abs(samples))
+    if peak > 0.98:
+        samples = samples / peak * 0.98
+    samples_int16 = (np.clip(samples, -1.0, 1.0) * 32767).astype(np.int16)
+    stereo = np.column_stack((samples_int16, samples_int16)).ravel()
     with wave.open(filepath, "w") as wf:
         wf.setnchannels(2)
         wf.setsampwidth(2)
         wf.setframerate(SAMPLE_RATE)
-        wf.writeframes(samples_int16.tobytes())
-    print(f"  Saved: {filepath}")
+        wf.writeframes(stereo.tobytes())
 
 
 def detect_speech_regions(speech_audio: np.ndarray, silence_thresh: float = 0.02, min_silence_ms: int = 200) -> list:
@@ -109,7 +113,8 @@ def mix_with_ducking(speech_audio: np.ndarray, beat_audio: np.ndarray,
 
 
 def build_podcast_audio(speech_wav_path: str, beat_wav_path: str, output_path: str, bpm: int,
-                        intro_seconds: float = 4.0, outro_seconds: float = 6.0):
+                        intro_seconds: float = 4.0, outro_seconds: float = 6.0,
+                        duration_minutes: int | None = None):
     from .beat_generator import generate_beat
 
     speech = _load_wav_to_numpy(speech_wav_path)

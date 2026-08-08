@@ -7,7 +7,7 @@ client per API_SPEC.md.  Legacy /api/services/* models remain in core/models.py.
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -33,7 +33,7 @@ ArtifactStatus = str   # pending | ready | failed | deleted
 class ProvenanceMetadata(BaseModel):
     """Quality gate record for a segment.  Must be stored before TTS begins."""
     prompt_id: str = Field(..., description="Identifier for the generation prompt/template run")
-    model: str = Field(..., description="Server-side model/profile actually used")
+    model: Literal["server-managed"] = Field(default="server-managed", description="Fixed public sentinel; provider/model bindings are server-side")
     source_refs: list[str] = Field(default_factory=list, description="Source references when available")
     claim_notes: list[str] = Field(default_factory=list, description="Notes for claims or rationale when sources are unavailable")
     validation_status: ValidationStatus = Field(default="pending", description="Validation state")
@@ -114,12 +114,14 @@ class OutlinePreviewRequest(BaseModel):
     bpm: int = Field(..., ge=settings.min_bpm, le=settings.max_bpm, description="Beats per minute")
     duration_minutes: int = Field(default=5, ge=1, le=30, description="Target duration in minutes")
     llm_profile_id: Optional[str] = Field(default="default", description="Server-defined safe LLM profile id")
+    tts_profile_id: Optional[str] = Field(default=None, description="Server-defined safe TTS profile id")
 
 
 class SpeakerProfile(BaseModel):
     """Dialogue speaker profile used by script generation prompts."""
     name: Optional[str] = Field(default=None, max_length=80, description="Display name or role label")
-    voice: Optional[str] = Field(default=None, max_length=120, description="Voice description or future voice id")
+    voice_id: Optional[str] = Field(default=None, max_length=64, description="Opaque voice ID from /api/v1/config")
+    voice: Optional[str] = Field(default=None, max_length=120, description="Legacy display-only voice description")
     tone: Optional[str] = Field(default=None, max_length=120, description="Speaking tone")
     humor: Optional[str] = Field(default=None, max_length=120, description="Humor level/style")
     style: Optional[str] = Field(default=None, max_length=160, description="Interviewing or expertise style")
@@ -135,6 +137,7 @@ class ProjectCreateRequest(BaseModel):
     voice_id: Optional[str] = Field(default=None, description="Voice ID from /api/v1/config voices list")
     llm_profile_id: Optional[str] = Field(default="default", description="Server-defined safe LLM profile id")
     tts_profile_id: Optional[str] = Field(default="default", description="Server-defined safe TTS profile id")
+    outline_preview_id: Optional[str] = Field(default=None, max_length=80, description="Opaque approved outline preview binding")
     approved_outline: Optional[ProjectOutlineResponse] = Field(default=None, description="User-reviewed outline to use for script generation")
     interviewer_profile: Optional[SpeakerProfile] = Field(default=None, description="Interviewer voice, tone, humor, and style")
     sme_profile: Optional[SpeakerProfile] = Field(default=None, description="Subject matter expert guest voice, tone, humor, and expertise")
@@ -216,16 +219,41 @@ class HealthResponse(BaseModel):
     uptime_seconds: float
 
 
-class VoiceProfile(BaseModel):
-    id: str
+class LLMProfileSummary(BaseModel):
+    id: str = Field(..., pattern=r"^[a-z0-9][a-z0-9-]{0,63}$")
     label: str
+    description: Optional[str] = None
+
+
+class TTSProfileSummary(BaseModel):
+    id: str = Field(..., pattern=r"^[a-z0-9][a-z0-9-]{0,63}$")
+    label: str
+    description: Optional[str] = None
+
+
+class VoiceProfile(BaseModel):
+    id: str = Field(..., pattern=r"^[a-z0-9][a-z0-9-]{0,63}$")
+    label: str
+    roles: list[Literal["interviewer", "guest"]] = Field(default_factory=list)
+
+
+class OutlinePreviewResponse(ProjectOutlineResponse):
+    """Safe, immutable profile binding for an outline preview."""
+    outline_preview_id: str
+    llm_profile_id: str
+    tts_profile_id: str
+    routing_revision: str
+    tts_routing_revision: str
+    expires_at: str
 
 
 class ConfigResponse(BaseModel):
     """GET /api/v1/config — safe for iOS to display."""
-    llm_profiles: list[VoiceProfile] = Field(default_factory=list)
-    tts_profiles: list[VoiceProfile] = Field(default_factory=list)
+    llm_profiles: list[LLMProfileSummary] = Field(default_factory=list)
+    tts_profiles: list[TTSProfileSummary] = Field(default_factory=list)
     voices: list[VoiceProfile] = Field(default_factory=list)
+    default_llm_profile_id: Optional[str] = None
+    default_tts_profile_id: Optional[str] = None
     bpm_range: dict = Field(default_factory=lambda: {"min": settings.min_bpm, "max": settings.max_bpm})
     duration_minutes_range: dict = Field(default_factory=lambda: {"min": 1, "max": 30})
 

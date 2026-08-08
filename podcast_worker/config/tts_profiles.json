@@ -1,0 +1,34 @@
+{
+  "schema_version": 1,
+  "default_profile_id": "studio-dialogue",
+  "voices": [
+    {"id": "interviewer-rachel", "label": "Rachel", "roles": ["interviewer"]},
+    {"id": "interviewer-bella", "label": "Bella", "roles": ["interviewer"]},
+    {"id": "guest-adam", "label": "Adam", "roles": ["guest"]},
+    {"id": "guest-josh", "label": "Josh", "roles": ["guest"]}
+  ],
+  "profiles": [
+    {
+      "id": "studio-dialogue",
+      "label": "Studio dialogue",
+      "description": "Natural two-speaker ElevenLabs v3 dialogue.",
+      "provider": "elevenlabs",
+      "strategy": "text_to_dialogue_v3",
+      "model_id": "eleven_v3",
+      "output_format": "mp3_44100_128",
+      "default_interviewer_voice_id": "interviewer-rachel",
+      "default_guest_voice_id": "guest-adam",
+      "voice_bindings": {
+        "interviewer-rachel": {"provider_voice_id": "21m00Tcm4TlvDq8ikWAM"},
+        "interviewer-bella": {"provider_voice_id": "EXAVITQu4vr4xnSDxMaL"},
+        "guest-adam": {"provider_voice_id": "pNInz6obpgDQGcFmaJgB"},
+        "guest-josh": {"provider_voice_id": "TxGEqnHWrfWFTfGW9XjX"}
+      },
+      "max_scene_characters": 1800,
+      "max_scene_turns": 10,
+      "max_fragment_characters": 0,
+      "max_attempts": 2,
+      "max_concurrent_requests": 4
+    }
+  ]
+}

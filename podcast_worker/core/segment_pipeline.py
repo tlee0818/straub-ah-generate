@@ -11,6 +11,7 @@ Key invariants (per API_SPEC.md):
 from __future__ import annotations
 
 import hashlib
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import os
 import threading
 import uuid
@@ -67,19 +68,22 @@ def _run_pipeline(db_path: str, project_id: str, output_dir: str,
     _sync_status(db_path, project_id, "generating")
 
     # 2. Generate script via LLM
-    provider = cfg.settings.llm_provider
-    model = cfg.settings.openai_model if provider == "openai" else cfg.settings.openrouter_model
-
+    execution = persistence._get_project_execution(db_path, project_id)
+    if execution is None:
+        raise PodcastWorkerError("missing_project_execution")
+    llm_snapshot = cfg.execution_snapshot_from_payload(execution["llm_snapshot"], execution["llm_revision"])
+    tts_snapshot = cfg.tts_snapshot_from_payload(execution["tts_snapshot"], execution["tts_revision"])
+    ledger_id = execution["ledger_id"]
     script = generate_script(
         topic=topic,
         bpm=bpm,
         duration_minutes=duration_minutes,
-        provider=provider,
-        model=model,
         outline=outline,
         interviewer_profile=interviewer_profile,
         sme_profile=sme_profile,
+        snapshot=llm_snapshot,
     )
+    model = "server-managed"
     episode_title = script.get("title", topic)
 
     # 3. Create segments in the DB from outline-first generated sections
@@ -116,7 +120,7 @@ def _run_pipeline(db_path: str, project_id: str, output_dir: str,
     for seg in segments:
         try:
             _process_segment(db_path, project_id, seg, output_dir, beat_path,
-                             bpm, duration_minutes, voice_id, model)
+                             bpm, duration_minutes, voice_id, model, tts_snapshot, ledger_id)
             seg_after = _sync_get_segment(db_path, seg["segment_id"])
             if seg_after and seg_after["status"] == "ready":
                 ready_count += 1
@@ -144,7 +148,8 @@ def _run_pipeline(db_path: str, project_id: str, output_dir: str,
 def _process_segment(db_path: str, project_id: str, segment: dict,
                      output_dir: str, beat_path: Path, bpm: int,
                      duration_minutes: int, voice_id: str | None,
-                     script_model: str) -> None:
+                     script_model: str, tts_snapshot: cfg.ResolvedTTSSnapshot,
+                     ledger_id: str) -> None:
     seg_id = segment["segment_id"]
     text = segment.get("text") or ""
     subtopic = segment.get("subtopic", "")
@@ -167,12 +172,63 @@ def _process_segment(db_path: str, project_id: str, segment: dict,
 
     # ── tts ──
     _sync_update_segment_status(db_path, seg_id, "tts")
-    tts_provider = cfg.settings.tts_provider
-    tts_voice = voice_id or cfg.settings.edge_tts_voice
-
     speech_path = Path(output_dir) / f"speech_{seg_id}.mp3"
     speech_path.parent.mkdir(parents=True, exist_ok=True)
-    synthesize(text, str(speech_path), provider=tts_provider, voice=tts_voice)
+    if tts_snapshot.provider == "elevenlabs":
+        from podcast_worker.core.tts_engine import plan_dialogue_requests, synthesize_elevenlabs_plan
+        from pydub import AudioSegment
+
+        plans = plan_dialogue_requests(text, tts_snapshot)
+        rendered_by_plan: dict[str, str] = {}
+
+        for plan in plans:
+            _persist_tts_plan(db_path, project_id, seg_id, plan)
+
+        def render(plan):
+            attempt_id = _short_id("att")
+            characters = len("".join(turn.text for turn in plan.turns))
+            _append_tts_ledger_entry(db_path, ledger_id, plan.plan_id, attempt_id, "reserved", characters)
+            _persist_tts_attempt(db_path, ledger_id, plan, attempt_id, tts_snapshot, "dispatched")
+            try:
+                rendered_path = synthesize_elevenlabs_plan(
+                    plan, tts_snapshot, str(speech_path.with_name(f"{speech_path.stem}-{plan.plan_id}.mp3"))
+                )
+            except Exception as exc:
+                _persist_tts_attempt(
+                    db_path, ledger_id, plan, attempt_id, tts_snapshot, "unknown_outcome",
+                    {"error": str(exc)},
+                )
+                raise
+            _persist_tts_attempt(db_path, ledger_id, plan, attempt_id, tts_snapshot, "published")
+            _append_tts_ledger_entry(db_path, ledger_id, plan.plan_id, attempt_id, "actual", characters)
+            _append_tts_ledger_entry(db_path, ledger_id, plan.plan_id, attempt_id, "released", characters)
+            return plan.plan_id, rendered_path
+
+        worker_count = min(len(plans), max(1, tts_snapshot.max_concurrent_requests))
+        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix=f"tts-{seg_id}") as executor:
+            futures = {executor.submit(render, plan): plan.plan_id for plan in plans}
+            try:
+                for future in as_completed(futures):
+                    plan_id, rendered_path = future.result()
+                    rendered_by_plan[plan_id] = rendered_path
+            except Exception:
+                for future in futures:
+                    future.cancel()
+                raise
+
+        rendered = [rendered_by_plan[plan.plan_id] for plan in plans]
+        combined = AudioSegment.empty()
+        for rendered_path in rendered:
+            combined += AudioSegment.from_file(rendered_path)
+        combined.export(speech_path, format="mp3")
+        _persist_audio_assembly(db_path, project_id, seg_id, rendered)
+    else:
+        synthesize(
+            text,
+            provider=tts_snapshot.provider,
+            output_path=str(speech_path),
+            voice=tts_snapshot.voice_bindings["interviewer"],
+        )
 
     # Convert to WAV for mixing
     speech_wav = Path(output_dir) / f"speech_{seg_id}.wav"
@@ -280,6 +336,47 @@ def _create_final_artifact(db_path: str, project_id: str, output_dir: str,
     _sync_status(db_path, project_id, "ready",
                  final_download_ready=True, final_artifact_id=final_artifact_id)
 
+
+def _persist_tts_plan(db_path: str, project_id: str, segment_id: str, plan) -> None:
+    persistence._upsert_durable_record(db_path, "tts_request_plans", {
+        "plan_id": plan.plan_id, "project_id": project_id, "segment_id": segment_id,
+        "strategy": plan.strategy, "state": "pending",
+        "payload_json": {"turns": [{"role": turn.role, "text": turn.text} for turn in plan.turns],
+                         "voice_binding": plan.voice_binding},
+    })
+
+
+def _persist_tts_attempt(db_path: str, ledger_id: str, plan, attempt_id: str,
+                         snapshot: cfg.ResolvedTTSSnapshot, outcome: str,
+                         error: dict | None = None) -> None:
+    persistence._upsert_durable_record(db_path, "execution_attempts", {
+        "attempt_id": attempt_id, "ledger_id": ledger_id, "plan_id": plan.plan_id,
+        "category": "tts", "correlation_id": plan.plan_id, "snapshot_revision": snapshot.revision,
+        "binding_json": {"provider": snapshot.provider, "model_id": snapshot.model_id,
+                         "strategy": snapshot.strategy, "voice_binding": plan.voice_binding},
+        "outcome": outcome, "error_json": error,
+    })
+
+
+def _append_tts_ledger_entry(db_path: str, ledger_id: str, plan_id: str,
+                             attempt_id: str, state: str, characters: int) -> None:
+    persistence._append_ledger_entry(db_path, {
+        "entry_id": _short_id("ledent"), "ledger_id": ledger_id, "category": "tts",
+        "operation_type": "dialogue_synthesis", "correlation_id": plan_id,
+        "resource_unit": "characters", "amount": characters, "state": state,
+        "attempt_id": attempt_id,
+    })
+
+
+def _persist_audio_assembly(db_path: str, project_id: str, segment_id: str,
+                            source_paths: list[str]) -> None:
+    manifest = [{"path": path, "gap_ms": 0, "crossfade_ms": 0} for path in source_paths]
+    persistence._upsert_durable_record(db_path, "audio_assemblies", {
+        "assembly_id": _short_id("asm"), "project_id": project_id, "segment_id": segment_id,
+        "manifest_json": manifest,
+        "manifest_sha256": hashlib.sha256(repr(manifest).encode()).hexdigest(),
+        "processing_revision": "assembly-v1", "state": "assembled",
+    })
 
 # ── Sync helpers (callable from background thread, not async) ────────────
 

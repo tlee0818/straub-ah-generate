@@ -75,9 +75,13 @@ class AppState:
         self.jobs: dict[str, dict] = {}
         # In-memory script store
         self.scripts: dict[str, dict] = {}
-        # Default output directory
-        project_root = Path(__file__).resolve().parent.parent
-        self.output_dir = project_root / "output"
+        # Default output directory, configurable for container deployments.
+        configured_output_dir = Path(cfg.settings.output_dir)
+        if configured_output_dir.is_absolute():
+            self.output_dir = configured_output_dir
+        else:
+            project_root = Path(__file__).resolve().parent.parent
+            self.output_dir = project_root / configured_output_dir
 
 
 state = AppState()

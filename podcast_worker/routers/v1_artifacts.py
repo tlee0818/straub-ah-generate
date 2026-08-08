@@ -21,6 +21,17 @@ from podcast_worker.core.models_v1 import (
 )
 
 router = APIRouter(prefix="/api/v1/artifacts", tags=["v1-artifacts"])
+_PUBLIC_ARTIFACT_KINDS = {"segment_audio", "final_mp3", "script_json"}
+
+
+def _deny_internal_artifact(artifact: dict) -> None:
+    if artifact.get("kind") not in _PUBLIC_ARTIFACT_KINDS:
+        raise HTTPException(
+            status_code=404,
+            detail=ErrorEnvelope(error=ErrorResponse(
+                code="not_found", message="Artifact not found."
+            )).model_dump(),
+        )
 
 
 def _db_path() -> str:
@@ -64,6 +75,7 @@ async def download_artifact(artifact_id: str, owner_id: str = Depends(require_au
                 ),
             ).model_dump(),
         )
+    _deny_internal_artifact(artifact)
 
     if artifact.get("status") != "ready":
         raise HTTPException(
@@ -148,6 +160,7 @@ async def refresh_transfer_url(artifact_id: str, owner_id: str = Depends(require
                 ),
             ).model_dump(),
         )
+    _deny_internal_artifact(artifact)
 
     # Verify ownership
     project_id = artifact.get("project_id")

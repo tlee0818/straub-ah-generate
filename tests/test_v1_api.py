@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+import threading
 from pathlib import Path
 
 import pytest
@@ -34,6 +35,17 @@ def _patch_config(monkeypatch):
     # Patch the singleton's attributes directly (env vars are read at construction time)
     monkeypatch.setattr(cfg, "auth_token", "test-token-abc123")
     monkeypatch.setattr(cfg, "db_path", db_path)
+    monkeypatch.setattr(cfg, "llm_routing_profiles_json", "")
+    monkeypatch.setattr(cfg, "tts_profiles_json", "")
+    monkeypatch.setattr(cfg, "tts_provider", "elevenlabs")
+    monkeypatch.setattr(cfg, "elevenlabs_api_key", "test-elevenlabs-key")
+    from podcast_worker.routers import v1_projects
+
+    monkeypatch.setattr(
+        v1_projects,
+        "_generation_slots",
+        threading.Semaphore(cfg.max_concurrent_generations),
+    )
 
     yield
 
@@ -73,20 +85,28 @@ class TestHealth:
         assert data["version"] == "2.0.0"
         assert "uptime_seconds" in data
 
-    def test_config_returns_safe_profiles(self, client):
-        resp = client.get("/api/v1/config")
+    def test_config_requires_auth_and_exposes_only_opaque_profiles(self, client, auth_headers):
+        assert client.get("/api/v1/config").status_code == 401
+
+        resp = client.get("/api/v1/config", headers=auth_headers)
         assert resp.status_code == 200
         data = resp.json()
-        assert len(data["llm_profiles"]) >= 1
-        assert len(data["voices"]) >= 1
-        assert data["bpm_range"]["min"] == 60
-        assert data["bpm_range"]["max"] == 220
-        assert data["duration_minutes_range"]["min"] == 1
-        assert data["duration_minutes_range"]["max"] == 30
-        # Config must never leak secrets
-        for profile in data["llm_profiles"]:
-            assert "api_key" not in profile
-            assert "secret" not in profile
+        assert [item["id"] for item in data["llm_profiles"]] == ["economy", "balanced"]
+        assert [item["id"] for item in data["tts_profiles"]] == ["studio-dialogue"]
+        assert [item["id"] for item in data["voices"]] == [
+            "interviewer-rachel",
+            "interviewer-bella",
+            "guest-adam",
+            "guest-josh",
+        ]
+        assert data["default_llm_profile_id"] == "balanced"
+        assert data["default_tts_profile_id"] == "studio-dialogue"
+        assert data["bpm_range"] == {"min": 60, "max": 220}
+        assert data["duration_minutes_range"] == {"min": 1, "max": 30}
+
+        serialized = str(data).lower()
+        for forbidden in ("provider", "model", "api_key", "key", "strategy", "voice_binding"):
+            assert forbidden not in serialized
 
 
 # ── Auth ──────────────────────────────────────────────────────────────────
@@ -143,7 +163,7 @@ class TestProjectsCRUD:
     def test_outline_preview_returns_reviewable_plan(self, client, auth_headers, monkeypatch):
         from podcast_worker.routers import v1_projects
 
-        def fake_generate_script_outline(topic, bpm, duration_minutes, provider=None, model=None):
+        def fake_generate_script_outline(topic, bpm, duration_minutes, provider=None, model=None, snapshot=None):
             return {
                 "title": f"{topic.title()} Outline",
                 "sections": [
@@ -178,6 +198,12 @@ class TestProjectsCRUD:
             "Develop the idea",
         ]
         assert "text" not in data["sections"][0]
+        assert data["outline_preview_id"].startswith("opv_")
+        assert data["llm_profile_id"] == "balanced"
+        assert data["tts_profile_id"] == "studio-dialogue"
+        assert data["routing_revision"].startswith("rte_")
+        assert data["tts_routing_revision"].startswith("tts_")
+        assert "expires_at" in data
 
     def test_preview_outline_requires_auth(self, client):
         resp = client.post(
@@ -382,6 +408,19 @@ class TestArtifacts:
     def test_artifact_access_requires_auth(self, client):
         resp = client.get("/api/v1/artifacts/art_anything")
         assert resp.status_code == 401
+    def test_internal_artifact_is_not_publicly_addressable(self, client, auth_headers):
+        from podcast_worker.core import persistence
+        from podcast_worker.core.config import settings as cfg
+
+        persistence._create_project(cfg.db_path, "prj_internal", "single-user", "topic", 120, 5)
+        persistence._add_artifact(cfg.db_path, {
+            "artifact_id": "art_internal", "project_id": "prj_internal", "segment_id": None,
+            "kind": "execution_snapshot", "content_type": "application/json", "status": "ready",
+            "download_url": "/api/v1/artifacts/art_internal",
+        })
+
+        assert client.get("/api/v1/artifacts/art_internal", headers=auth_headers).status_code == 404
+        assert client.post("/api/v1/artifacts/art_internal/transfer-url", headers=auth_headers).status_code == 404
 
 
 # ── Durability ────────────────────────────────────────────────────────────

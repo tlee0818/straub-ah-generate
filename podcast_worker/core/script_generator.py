@@ -6,14 +6,31 @@ point that delegates to a shared provider client.
 """
 
 import json
+from dataclasses import dataclass
+from typing import Literal
 from typing import Any, Optional
 
 from . import config
+from .config import ResolvedExecutionSnapshot, RoutingConfigurationError
 
 
 # ---------------------------------------------------------------------------
 # Shared LLM client wrappers
 # ---------------------------------------------------------------------------
+
+
+def _strict_json(text: str, dialect: str) -> dict[str, Any]:
+    """Decode provider output without accepting arbitrary surrounding prose."""
+    value = text.strip()
+    if dialect == "openrouter_legacy_prompt_strict_parse" and value.startswith("```json") and value.endswith("```"):
+        value = value[7:-3].strip()
+    try:
+        parsed = json.loads(value)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise RoutingConfigurationError("structured_output_failure") from exc
+    if not isinstance(parsed, dict):
+        raise RoutingConfigurationError("structured_output_failure")
+    return parsed
 
 
 def _call_openai(
@@ -23,50 +40,30 @@ def _call_openai(
     model: Optional[str] = None,
     temperature: float = 0.8,
     base_url: Optional[str] = None,
+    dialect: str = "openai_json_object",
 ) -> dict[str, Any]:
-    """Call OpenAI-compatible API and return parsed JSON response."""
+    """Call an OpenAI-compatible endpoint using the route's declared JSON dialect."""
     from openai import OpenAI
 
     key = api_key or config.OPENAI_API_KEY
     if not key and not base_url:
-        raise ValueError(
-            "OpenAI API key not set. Set PODCAST_OPENAI_API_KEY env var "
-            "or pass api_key."
-        )
-
-    model_name = model or config.OPENAI_MODEL
+        raise ValueError("OpenAI API key not set. Set PODCAST_OPENAI_API_KEY env var or pass api_key.")
     client_kwargs: dict[str, Any] = {"api_key": key}
     if base_url:
         client_kwargs["base_url"] = base_url
-
-    client = OpenAI(**client_kwargs)
-    extra_kwargs: dict[str, Any] = {"temperature": temperature}
-
-    # OpenAI native responses use response_format; others use extra_headers
+    options: dict[str, Any] = {"temperature": temperature}
+    if dialect == "openai_json_object":
+        options["response_format"] = {"type": "json_object"}
+    elif dialect != "openrouter_legacy_prompt_strict_parse":
+        raise RoutingConfigurationError("unsupported_llm_dialect")
     if base_url:
-        extra_kwargs["extra_headers"] = {
-            "HTTP-Referer": "https://github.com/straub-ah",
-            "X-Title": "BPM Podcast Generator",
-        }
-    else:
-        extra_kwargs["response_format"] = {"type": "json_object"}
-
-    response = client.chat.completions.create(
-        model=model_name,
-        messages=[
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-        **extra_kwargs,
+        options["extra_headers"] = {"HTTP-Referer": "https://github.com/straub-ah", "X-Title": "BPM Podcast Generator"}
+    response = OpenAI(**client_kwargs).chat.completions.create(
+        model=model or config.OPENAI_MODEL,
+        messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
+        **options,
     )
-
-    text = response.choices[0].message.content
-    # Some routers (OpenRouter) wrap JSON in markdown fences
-    text = text.strip()
-    if text.startswith("```"):
-        text = text.split("\n", 1)[1]
-        text = text.rsplit("```", 1)[0]
-    return json.loads(text.strip())
+    return _strict_json(response.choices[0].message.content or "", dialect)
 
 
 def _call_ollama(
@@ -75,25 +72,16 @@ def _call_ollama(
     base_url: Optional[str] = None,
     model: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Call Ollama API and return parsed JSON response."""
+    """Call Ollama's explicitly declared JSON mode."""
     import requests
 
-    url = base_url or config.OLLAMA_BASE_URL
-    model_name = model or config.OLLAMA_MODEL
-    prompt = f"{system_prompt}\n\n{user_prompt}"
-
-    resp = requests.post(
-        f"{url}/api/generate",
-        json={
-            "model": model_name,
-            "prompt": prompt,
-            "stream": False,
-            "format": "json",
-        },
+    response = requests.post(
+        f"{base_url or config.OLLAMA_BASE_URL}/api/generate",
+        json={"model": model or config.OLLAMA_MODEL, "prompt": f"{system_prompt}\n\n{user_prompt}", "stream": False, "format": "json"},
         timeout=120,
     )
-    resp.raise_for_status()
-    return json.loads(resp.json()["response"])
+    response.raise_for_status()
+    return _strict_json(response.json().get("response", ""), "ollama_format_json")
 
 
 def _call_provider(
@@ -103,25 +91,22 @@ def _call_provider(
     api_key: Optional[str] = None,
     model: Optional[str] = None,
     temperature: float = 0.8,
+    *,
+    snapshot: ResolvedExecutionSnapshot | None = None,
+    purpose: str | None = None,
 ) -> dict[str, Any]:
-    """Unified dispatch: route to the right provider and return parsed JSON."""
-    provider = provider or config.LLM_PROVIDER
-
-    if provider == "openai":
-        return _call_openai(system_prompt, user_prompt, api_key, model, temperature)
-    elif provider == "ollama":
-        return _call_ollama(system_prompt, user_prompt, model=model)
-    elif provider == "openrouter":
-        return _call_openai(
-            system_prompt,
-            user_prompt,
-            api_key=api_key,
-            model=model or config.OPENROUTER_MODEL,
-            temperature=temperature,
-            base_url=config.OPENROUTER_BASE_URL,
-        )
-    else:
-        raise ValueError(f"Unknown LLM provider: {provider}")
+    """Dispatch a purpose through an immutable snapshot, or legacy scalar routing."""
+    route = snapshot.route_for(purpose) if snapshot and purpose else None
+    selected_provider = route.provider if route else (provider or config.LLM_PROVIDER)
+    selected_model = route.model if route else model
+    selected_temperature = route.temperature if route else temperature
+    if selected_provider == "openai":
+        return _call_openai(system_prompt, user_prompt, api_key, selected_model, selected_temperature, dialect=route.dialect if route else "openai_json_object")
+    if selected_provider == "ollama":
+        return _call_ollama(system_prompt, user_prompt, model=selected_model)
+    if selected_provider == "openrouter":
+        return _call_openai(system_prompt, user_prompt, api_key, selected_model or config.OPENROUTER_MODEL, selected_temperature, config.OPENROUTER_BASE_URL, route.dialect if route else "openrouter_legacy_prompt_strict_parse")
+    raise RoutingConfigurationError("unknown_llm_provider")
 
 
 # ---------------------------------------------------------------------------
@@ -156,10 +141,11 @@ The podcast will be played over a beat at {bpm} BPM, so the {pace}.
 Important rules:
 - {sentence_length}
 - Use natural conversational language — like a knowledgeable friend explaining something
+- Write for the ear: contractions, short speakable lines, active voice, and clear first-listen explanations
 - Avoid markdown, lists, or special formatting
 - Include brief pauses marked with [pause]
 - The entire script should take about {duration_minutes} minutes to read at natural pace
-- Do NOT use sound effect notations like [music], [applause] — only [pause] is allowed
+- Do NOT use production sound effect notations like [music], [applause], [rimshot], or [sfx]
 - NO special characters or emojis"""
 
 
@@ -172,7 +158,7 @@ def _get_outline_prompt(topic: str, bpm: int, duration_minutes: int = 5) -> str:
 TOPIC: {topic}
 {style_context}
 
-Create a section outline before any script text is written. The outline should include a hook/intro, several content sections, and an outro. Each section topic should be specific enough that it can be written independently while still fitting the full episode.
+Create a section outline before any script text is written. The outline should include a hook/intro, several content sections, and an outro. Each section topic should be specific enough that it can be written independently while still fitting the full episode. Plan a progression that can support a natural host/guest conversation, including callback opportunities between sections where useful, but do not write dialogue or stage directions in the outline.
 
 Return ONLY valid JSON with this exact structure:
 {{
@@ -227,7 +213,7 @@ EPISODE TOPIC: {topic}
 APPROVED OUTLINE:
 {_format_outline_for_prompt(outline)}
 
-Create a research brief that delegates one focused research lane to each outline section. Include clarifying follow-up questions the host could ask the listener if the topic needs sharper intent before script writing.
+Create a research brief that delegates one focused research lane to each outline section. Include clarifying follow-up questions the host could ask the listener if the topic needs sharper intent before script writing. Include presentation hooks the dialogue agents can use later: recurring metaphor or callback seeds, host skepticism angles, guest nuance boundaries, and places where uncertainty should be explicitly acknowledged. Treat these as delivery guidance, not new factual claims.
 
 Return ONLY valid JSON with this exact structure:
 {{
@@ -261,7 +247,7 @@ FULL OUTLINE:
 LEAD RESEARCH BRIEF:
 {json.dumps(research_brief, ensure_ascii=False)}
 
-Find the ideas, examples, definitions, tensions, and open questions that would make this section specific and useful. If the section needs more user intent, include follow_up_questions that can be shown to the user before final generation.
+Find the ideas, examples, definitions, tensions, and open questions that would make this section specific and useful. If the section needs more user intent, include follow_up_questions that can be shown to the user before final generation. Include section-level conversation opportunities: one concrete example, one likely host follow-up or skeptical interruption, any callback to earlier outline sections, and cautions that banter must not overstate.
 
 Return ONLY valid JSON with this exact structure:
 {{
@@ -296,6 +282,43 @@ def _format_speaker_profiles(interviewer_profile: Optional[dict], sme_profile: O
             _speaker_profile("SME guest", sme_profile),
         ]
     )
+
+
+def _get_realism_context() -> str:
+    """Build guidance for realistic, TTS-friendly podcast dialogue."""
+    level = config.settings.realism_level
+    allow_nonverbal = config.settings.allow_nonverbal_cues
+
+    if level == "subtle":
+        frequency = "Use one small human texture moment about every 8-12 dialogue turns."
+        intensity = "Keep the show polished and mostly clean."
+    elif level == "expressive":
+        frequency = "Use one small human texture moment about every 4-6 dialogue turns when motivated."
+        intensity = "Allow more warmth, surprise, and playful host chemistry, but never turn it into parody."
+    else:
+        frequency = "Use one small human texture moment about every 6-8 dialogue turns when motivated."
+        intensity = "Aim for edited naturalism: clean enough to follow, imperfect enough to feel human."
+
+    if allow_nonverbal:
+        cue_rule = (
+            "Allowed nonverbal performance cues are [pause], [laughs], [small laugh], "
+            "[sighs], [clears throat], and [coughs]. Use [coughs] at most once in an entire episode "
+            "and only when it serves a joke, nervous reset, or self-correction."
+        )
+    else:
+        cue_rule = "Only [pause] is allowed as a bracketed cue; imply laughs or breaths through wording instead."
+
+    return f"""REALISTIC PODCAST DIALOGUE GUIDANCE:
+- {intensity}
+- {frequency}
+- Prefer conversational behavior over filler: correction, clarification, surprise, mild disagreement, callbacks, quick summaries, and listener-aware framing.
+- Vary turn length. Mix short reactions, skeptical questions, concise explanations, and occasional one-line jokes; avoid perfect paragraph-by-paragraph alternation.
+- Give the Interviewer and SME distinct rhythms. The Interviewer can interrupt gently, challenge, recap, or represent listener confusion. The SME can correct, qualify, and ground claims in examples.
+- Use fillers such as "uh", "I mean", "you know", and "let me rephrase that" only when they reveal thought, uncertainty, or self-correction.
+- Let speakers occasionally overlap in spirit with phrases like "Wait—", "Hold on", "Right, but", or "Exactly", but keep the transcript readable for TTS.
+- {cue_rule}
+- Do not add random laughs, coughs, or throat-clearing. Every cue must have a conversational reason.
+- Do not sacrifice factual precision for banter. If the facts are complex, have a speaker pause and restate them clearly."""
 
 
 def _get_section_prompt(
@@ -351,7 +374,10 @@ RESEARCH CONTEXT:
 SPEAKER AGENTS:
 {_format_speaker_profiles(interviewer_profile, sme_profile)}
 
-Write ONLY the current section as a natural two-person podcast dialogue between the Interviewer and the SME guest. The interviewer should ask sharp, curious follow-ups and steer pacing; the SME should provide expertise, examples, and nuance. Use the previous section text for continuity, but do not repeat it. Use the research context for specificity, examples, nuance, and intriguing framing. Lead naturally toward the next topic when one exists.
+REALISM AND PERFORMANCE:
+{_get_realism_context()}
+
+Write ONLY the current section as a natural two-person podcast dialogue between the Interviewer and the SME guest. The interviewer should ask sharp, curious follow-ups and steer pacing; the SME should provide expertise, examples, and nuance. Use the previous section text for continuity, but do not repeat it. Use the research context for specificity, examples, nuance, and intriguing framing. Add realistic host/guest texture where it helps: brief reactions, self-corrections, callbacks, mild disagreement, motivated laughs or coughs, and listener-oriented recaps. Lead naturally toward the next topic when one exists.
 
 Return ONLY valid JSON with this exact structure:
 {{
@@ -430,6 +456,7 @@ def generate_script_outline(
     bpm: int,
     duration_minutes: int = 5,
     provider: Optional[str] = None,
+    snapshot: ResolvedExecutionSnapshot | None = None,
     **kwargs,
 ) -> dict:
     """Generate a podcast section outline without writing full script text."""
@@ -438,6 +465,8 @@ def generate_script_outline(
         "You are a podcast outline planner. You output raw JSON only.",
         outline_prompt,
         provider=provider,
+        snapshot=snapshot,
+        purpose="outline",
         **kwargs,
     )
 
@@ -446,6 +475,7 @@ def generate_research_brief(
     topic: str,
     outline: dict,
     provider: Optional[str] = None,
+    snapshot: ResolvedExecutionSnapshot | None = None,
     **kwargs,
 ) -> dict:
     """Run the lead research-agent step for an approved outline."""
@@ -454,6 +484,8 @@ def generate_research_brief(
         _get_research_brief_prompt(topic, outline),
         provider=provider,
         temperature=0.4,
+        snapshot=snapshot,
+        purpose="research_brief",
         **kwargs,
     )
 
@@ -464,6 +496,7 @@ def generate_subtopic_research(
     section: dict,
     research_brief: dict,
     provider: Optional[str] = None,
+    snapshot: ResolvedExecutionSnapshot | None = None,
     **kwargs,
 ) -> dict:
     """Run one subtopic research-agent step for an outline section."""
@@ -472,6 +505,8 @@ def generate_subtopic_research(
         _get_subtopic_research_prompt(topic, outline, section, research_brief),
         provider=provider,
         temperature=0.4,
+        snapshot=snapshot,
+        purpose="subtopic_research",
         **kwargs,
     )
 
@@ -500,15 +535,38 @@ RESEARCH CONTEXT:
 DRAFT DIALOGUE:
 {generated_text}
 
-Verify that the dialogue is faithful to the research context, does not overstate uncertain claims, and keeps the interviewer/SME roles clear. If a correction is needed, return corrected dialogue in verified_text. Preserve the two-speaker dialogue format.
+Verify that the dialogue is faithful to the research context, does not overstate uncertain claims, and keeps the interviewer/SME roles clear. If a correction is needed, return corrected dialogue in verified_text. Preserve the two-speaker dialogue format and keep realistic performance cues when they do not distort the facts; remove only cues that are random, excessive, or make a factual claim sound uncertain when it should be clear.
 
 Return ONLY valid JSON with this exact structure:
 {{
-    "is_factful": true,
+    "outcome": "accepted" | "corrected" | "blocked",
     "issues": ["Issue or empty list"],
-    "verified_text": "Corrected or unchanged dialogue text"
+    "verified_text": "Original/corrected dialogue, or null when blocked"
 }}
 """
+
+
+@dataclass(frozen=True)
+class VerificationResult:
+    outcome: Literal["accepted", "corrected", "blocked"]
+    issues: tuple[str, ...]
+    verified_text: str | None
+
+
+def parse_verification_result(value: dict[str, Any], draft: str) -> VerificationResult:
+    """Strict verifier gate: no unverified draft can reach TTS."""
+    outcome = value.get("outcome")
+    issues = value.get("issues")
+    verified_text = value.get("verified_text")
+    if outcome not in {"accepted", "corrected", "blocked"} or not isinstance(issues, list) or any(not isinstance(issue, str) or not issue.strip() for issue in issues):
+        raise RoutingConfigurationError("structured_output_failure")
+    if outcome == "accepted" and verified_text == draft and not issues:
+        return VerificationResult(outcome, tuple(), draft)
+    if outcome == "corrected" and isinstance(verified_text, str) and verified_text.strip() and issues:
+        return VerificationResult(outcome, tuple(issues), verified_text)
+    if outcome == "blocked" and verified_text is None and issues:
+        return VerificationResult(outcome, tuple(issues), None)
+    raise RoutingConfigurationError("structured_output_failure")
 
 
 def verify_section_factfulness(
@@ -519,16 +577,20 @@ def verify_section_factfulness(
     section_research: dict,
     generated_text: str,
     provider: Optional[str] = None,
+    snapshot: ResolvedExecutionSnapshot | None = None,
     **kwargs,
-) -> dict:
-    """Run the factfulness verification-agent step for one generated section."""
-    return _call_provider(
+) -> VerificationResult:
+    """Run the typed factfulness verifier for one generated section."""
+    value = _call_provider(
         "You are a factfulness verification agent for a podcast production team. You output raw JSON only.",
         _get_fact_check_prompt(topic, outline, section, research_brief, section_research, generated_text),
         provider=provider,
         temperature=0.2,
+        snapshot=snapshot,
+        purpose="fact_verification",
         **kwargs,
     )
+    return parse_verification_result(value, generated_text)
 
 
 def generate_script(
@@ -539,6 +601,7 @@ def generate_script(
     outline: Optional[dict] = None,
     interviewer_profile: Optional[dict] = None,
     sme_profile: Optional[dict] = None,
+    snapshot: ResolvedExecutionSnapshot | None = None,
     **kwargs,
 ) -> dict:
     """Generate a podcast script using outline-first section generation."""
@@ -548,6 +611,7 @@ def generate_script(
             bpm=bpm,
             duration_minutes=duration_minutes,
             provider=provider,
+            snapshot=snapshot,
             **kwargs,
         )
 
@@ -557,6 +621,7 @@ def generate_script(
         topic=topic,
         outline=outline,
         provider=provider,
+        snapshot=snapshot,
         **kwargs,
     )
     section_research_items = [
@@ -566,6 +631,7 @@ def generate_script(
             section=section,
             research_brief=research_brief,
             provider=provider,
+            snapshot=snapshot,
             **kwargs,
         )
         for section in sections
@@ -595,6 +661,8 @@ def generate_script(
             "You are a podcast script writer. You output raw JSON only.",
             section_prompt,
             provider=provider,
+            snapshot=snapshot,
+            purpose="dialogue_draft",
             **kwargs,
         )
         segment = generated_section.get("segment", generated_section)
@@ -606,9 +674,11 @@ def generate_script(
             section_research=section_research_items[index],
             generated_text=segment.get("text", ""),
             provider=provider,
+            snapshot=snapshot,
             **kwargs,
         )
-        verified_text = verification.get("verified_text") or segment.get("text", "")
+        if verification.outcome == "blocked":
+            raise RoutingConfigurationError("validation_failed")
         generated_segments.append(
             {
                 "segment_type": segment.get(
@@ -617,7 +687,7 @@ def generate_script(
                 ),
                 "subtopic": section.get("topic") or section.get("title") or topic,
                 "title": section.get("title") or section.get("topic"),
-                "text": verified_text,
+                "text": verification.verified_text,
                 "approx_duration_seconds": segment.get(
                     "approx_duration_seconds",
                     section.get("approx_duration_seconds", 45),

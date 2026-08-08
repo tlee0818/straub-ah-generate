@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "default_profile_id": "balanced",
+  "profiles": [
+    {
+      "id": "economy",
+      "label": "Economy",
+      "description": "Lowest-cost generation using DeepSeek V4 Flash.",
+      "routes": {
+        "outline": {"provider": "openrouter", "model": "deepseek/deepseek-v4-flash-0731", "dialect": "openrouter_legacy_prompt_strict_parse", "temperature": 0.7},
+        "research_brief": {"provider": "openrouter", "model": "deepseek/deepseek-v4-flash-0731", "dialect": "openrouter_legacy_prompt_strict_parse", "temperature": 0.3},
+        "subtopic_research": {"provider": "openrouter", "model": "deepseek/deepseek-v4-flash-0731", "dialect": "openrouter_legacy_prompt_strict_parse", "temperature": 0.3},
+        "dialogue_draft": {"provider": "openrouter", "model": "deepseek/deepseek-v4-flash-0731", "dialect": "openrouter_legacy_prompt_strict_parse", "temperature": 0.85},
+        "fact_verification": {"provider": "openrouter", "model": "deepseek/deepseek-v4-flash-0731", "dialect": "openrouter_legacy_prompt_strict_parse", "temperature": 0.1}
+      }
+    },
+    {
+      "id": "balanced",
+      "label": "Balanced",
+      "description": "Cost-efficient drafting with stronger research and verification.",
+      "routes": {
+        "outline": {"provider": "openrouter", "model": "deepseek/deepseek-v4-flash-0731", "dialect": "openrouter_legacy_prompt_strict_parse", "temperature": 0.7},
+        "research_brief": {"provider": "openrouter", "model": "google/gemini-2.5-flash", "dialect": "openrouter_legacy_prompt_strict_parse", "temperature": 0.25},
+        "subtopic_research": {"provider": "openrouter", "model": "google/gemini-2.5-flash", "dialect": "openrouter_legacy_prompt_strict_parse", "temperature": 0.25},
+        "dialogue_draft": {"provider": "openrouter", "model": "deepseek/deepseek-v4-flash-0731", "dialect": "openrouter_legacy_prompt_strict_parse", "temperature": 0.85},
+        "fact_verification": {"provider": "openrouter", "model": "google/gemini-2.5-flash", "dialect": "openrouter_legacy_prompt_strict_parse", "temperature": 0.1}
+      }
+    }
+  ]
+}

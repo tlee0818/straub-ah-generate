@@ -13,6 +13,10 @@ from podcast_worker.core.script_generator import (
     _get_follow_up_prompt,
     _get_outline_prompt,
     _get_section_prompt,
+    _get_research_brief_prompt,
+    _get_subtopic_research_prompt,
+    _get_fact_check_prompt,
+    _get_realism_context,
     _get_summary_prompt,
     generate_follow_up_questions,
     generate_script,
@@ -53,6 +57,8 @@ class TestScriptGenerationFlow:
         assert "topic" in prompt
         assert '"segments"' not in prompt
         assert '"text"' not in prompt
+        assert "natural host/guest conversation" in prompt
+        assert "do not write dialogue or stage directions" in prompt
 
     def test_section_prompt_includes_outline_neighbors_and_previous_text(self):
         outline = {
@@ -85,6 +91,54 @@ class TestScriptGenerationFlow:
         assert "Welcome text from the prior section." in prompt
         assert "RESEARCH CONTEXT" in prompt
         assert "Important research point" in prompt
+        assert "REALISM AND PERFORMANCE" in prompt
+        assert "motivated laughs or coughs" in prompt
+        assert "Allowed nonverbal performance cues" in prompt
+
+    def test_realism_context_can_disable_nonverbal_cues(self, monkeypatch):
+        monkeypatch.setattr(script_generator.config.settings, "allow_nonverbal_cues", False)
+
+        context = _get_realism_context()
+
+        assert "Only [pause] is allowed" in context
+        assert "imply laughs or breaths through wording" in context
+
+    def test_research_prompts_seed_conversation_hooks_without_new_claims(self):
+        outline = {
+            "title": "AI Safety",
+            "sections": [{"segment_type": "content", "topic": "Risk framing", "approx_duration_seconds": 45}],
+        }
+
+        brief_prompt = _get_research_brief_prompt("AI safety", outline)
+        subtopic_prompt = _get_subtopic_research_prompt(
+            "AI safety",
+            outline,
+            outline["sections"][0],
+            {"research_brief": "Lead context"},
+        )
+
+        assert "recurring metaphor or callback seeds" in brief_prompt
+        assert "Treat these as delivery guidance, not new factual claims" in brief_prompt
+        assert "likely host follow-up or skeptical interruption" in subtopic_prompt
+        assert "banter must not overstate" in subtopic_prompt
+
+    def test_fact_check_prompt_preserves_safe_texture_but_removes_excess(self):
+        outline = {
+            "title": "AI Safety",
+            "sections": [{"segment_type": "content", "topic": "Risk framing", "approx_duration_seconds": 45}],
+        }
+
+        prompt = _get_fact_check_prompt(
+            "AI safety",
+            outline,
+            outline["sections"][0],
+            {"research_brief": "Lead context"},
+            {"key_points": ["Important research point"]},
+            "Interviewer: Wait—so what matters here?\\nSME: The key point.",
+        )
+
+        assert "keep realistic performance cues" in prompt
+        assert "remove only cues that are random, excessive" in prompt
 
     def test_generate_script_calls_outline_then_each_section_with_context(self, monkeypatch):
         calls = []
@@ -122,7 +176,7 @@ class TestScriptGenerationFlow:
                 return research_responses[len([call for call in calls if "subtopic research agent" in call[0]]) - 1]
             if "factfulness verification agent" in system_prompt:
                 verified_index = len([call for call in calls if "factfulness verification agent" in call[0]]) - 1
-                return {"is_factful": True, "issues": [], "verified_text": section_responses[verified_index]["text"]}
+                return {"outcome": "accepted", "issues": [], "verified_text": section_responses[verified_index]["text"]}
             return section_responses[len([call for call in calls if "script writer" in call[0]]) - 1]
 
         monkeypatch.setattr(script_generator, "_call_provider", fake_call_provider)
@@ -169,7 +223,8 @@ class TestScriptGenerationFlow:
         assert all("script writer" in call[0] for call in (calls[5], calls[7], calls[9]))
         assert all("factfulness verification agent" in call[0] for call in (calls[6], calls[8], calls[10]))
         assert all(call[2] == "test-provider" for call in calls)
-        assert calls[0][3] == {"model": "test-model"}
+        assert calls[0][3]["model"] == "test-model"
+        assert calls[0][3]["snapshot"] is None
 
         second_section_prompt = calls[7][1]
         assert "FULL OUTLINE" in second_section_prompt
@@ -222,7 +277,7 @@ class TestSummaryPrompt:
 
 class TestGenerateFollowUpDispatch:
     def test_raises_on_unknown_provider(self):
-        with pytest.raises(ValueError, match="Unknown LLM provider"):
+        with pytest.raises(ValueError, match="unknown_llm_provider"):
             generate_follow_up_questions("AI", SAMPLE_SCRIPT, provider="nonexistent")
 
     def test_raises_openai_without_key(self):
@@ -233,7 +288,7 @@ class TestGenerateFollowUpDispatch:
 
 class TestGenerateSummaryDispatch:
     def test_raises_on_unknown_provider(self):
-        with pytest.raises(ValueError, match="Unknown LLM provider"):
+        with pytest.raises(ValueError, match="unknown_llm_provider"):
             generate_script_summary(SAMPLE_SCRIPT, provider="nonexistent")
 
     def test_raises_openai_without_key(self):
@@ -267,6 +322,9 @@ class TestPipelineSegmentCreation:
                 return {"research_brief": "Brief"}
             if "subtopic research agent" in system_prompt:
                 return {"key_points": ["Research point"]}
+            if "factfulness verification agent" in system_prompt:
+                index = len([call for call in calls if "script writer" in call]) - 1
+                return {"outcome": "accepted", "issues": [], "verified_text": responses[index]["text"]}
             return responses[len([call for call in calls if "script writer" in call]) - 1]
 
         monkeypatch.setattr(script_generator, "_call_provider", fake_call)
@@ -296,8 +354,14 @@ class TestPipelineSegmentCreation:
 
         def fake_call(*a, **kw):
             calls.append(1)
+            if "factfulness verification agent" in a[0]:
+                return {"outcome": "accepted", "issues": [], "verified_text": "Hook text."}
             if len(calls) == 1:
                 return outline
+            if "lead research agent" in a[0]:
+                return {"research_brief": "Brief"}
+            if "subtopic research agent" in a[0]:
+                return {"key_points": ["Research point"]}
             return {"segment_type": "intro", "text": "Hook text.", "approx_duration_seconds": 10}
 
         monkeypatch.setattr(script_generator, "_call_provider", fake_call)
@@ -333,7 +397,7 @@ class TestPipelineSegmentCreation:
                 return {"key_points": ["Research point"]}
             if "factfulness verification agent" in system_prompt:
                 verified_index = len([prompt for prompt in prompts if "DRAFT DIALOGUE:" not in prompt]) - 1
-                return {"is_factful": True, "issues": [], "verified_text": section_texts[verified_index]["text"]}
+                return {"outcome": "accepted", "issues": [], "verified_text": section_texts[verified_index]["text"]}
             prompts.append(user_prompt)
             return section_texts[len(prompts) - 1]
 
@@ -382,8 +446,14 @@ class TestPipelineSegmentDataFlow:
 
         def fake_call(*a, **kw):
             calls.append(1)
+            if "factfulness verification agent" in a[0]:
+                return {"outcome": "accepted", "issues": [], "verified_text": "Body text here."}
             if len(calls) == 1:
                 return outline
+            if "lead research agent" in a[0]:
+                return {"research_brief": "Brief"}
+            if "subtopic research agent" in a[0]:
+                return {"key_points": ["Research point"]}
             return {"segment_type": "content", "text": "Body text here.", "approx_duration_seconds": 42}
 
         monkeypatch.setattr(script_generator, "_call_provider", fake_call)
