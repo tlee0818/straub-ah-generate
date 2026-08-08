@@ -367,6 +367,7 @@ class TestVerificationGate:
         ("payload", "outcome", "text"),
         [
             ({"outcome": "accepted", "issues": [], "verified_text": "Interviewer: Draft"}, "accepted", "Interviewer: Draft"),
+            ({"outcome": "accepted", "issues": [], "verified_text": "Interviewer: Factful rewrite"}, "accepted", "Interviewer: Factful rewrite"),
             ({"outcome": "corrected", "issues": ["Unsupported claim"], "verified_text": "Interviewer: Corrected"}, "corrected", "Interviewer: Corrected"),
             ({"outcome": "blocked", "issues": ["Cannot verify"], "verified_text": None}, "blocked", None),
         ],
@@ -378,7 +379,6 @@ class TestVerificationGate:
     @pytest.mark.parametrize(
         "payload",
         [
-            {"outcome": "accepted", "issues": [], "verified_text": "altered"},
             {"outcome": "corrected", "issues": [], "verified_text": "corrected"},
             {"outcome": "blocked", "issues": ["reason"], "verified_text": "draft"},
             {"outcome": "unknown", "issues": [], "verified_text": "draft"},

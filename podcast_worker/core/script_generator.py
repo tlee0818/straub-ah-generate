@@ -679,8 +679,13 @@ def parse_verification_result(value: dict[str, Any], draft: str) -> Verification
     verified_text = value.get("verified_text")
     if outcome not in {"accepted", "corrected", "blocked"} or not isinstance(issues, list) or any(not isinstance(issue, str) or not issue.strip() for issue in issues):
         raise RoutingConfigurationError("structured_output_failure")
-    if outcome == "accepted" and verified_text == draft and not issues:
-        return VerificationResult(outcome, tuple(), draft)
+    if (
+        outcome == "accepted"
+        and isinstance(verified_text, str)
+        and verified_text.strip()
+        and not issues
+    ):
+        return VerificationResult(outcome, tuple(), verified_text)
     if outcome == "corrected" and isinstance(verified_text, str) and verified_text.strip() and issues:
         return VerificationResult(outcome, tuple(issues), verified_text)
     if outcome == "blocked" and verified_text is None and issues:
