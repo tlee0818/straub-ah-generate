@@ -29,6 +29,27 @@ def _tts_snapshot(max_concurrent_requests: int) -> ResolvedTTSSnapshot:
         MappingProxyType({"interviewer": "host", "guest": "guest"}), 1, 0, 0, None,
         max_concurrent_requests,
     )
+def test_verification_result_is_persistable_and_blocks_rejected_text():
+    accepted = SimpleNamespace(
+        outcome="accepted",
+        issues=(),
+        verified_text="Interviewer: Verified",
+    )
+
+    assert segment_pipeline._verification_payload(accepted) == {
+        "outcome": "accepted",
+        "issues": [],
+        "verified_text": "Interviewer: Verified",
+    }
+
+    blocked = SimpleNamespace(
+        outcome="blocked",
+        issues=("unsupported",),
+        verified_text=None,
+    )
+    with pytest.raises(RoutingConfigurationError, match="validation_failed"):
+        segment_pipeline._verification_payload(blocked)
+
 def test_pipeline_uses_persisted_llm_snapshot(monkeypatch):
     snapshot = _snapshot()
     captured = {}

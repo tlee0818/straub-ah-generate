@@ -94,6 +94,16 @@ def _provider_operation(
     ):
         raise FenceLost("provider result fence rejected")
     return result
+def _verification_payload(result) -> dict:
+    if result.outcome == "blocked" or result.verified_text is None:
+        raise RoutingConfigurationError("validation_failed")
+    return {
+        "outcome": result.outcome,
+        "issues": list(result.issues),
+        "verified_text": result.verified_text,
+    }
+
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -424,9 +434,16 @@ def _run_pipeline(db_path: str, work_id: str, owner: str, epoch: int, output_dir
             verification = _provider_operation(
                 db_path, work_id, owner, epoch,
                 f"{segment_id}:verify", segment_id, "fact_checking",
-                lambda: generate_verified_section(
-                    work["topic"], outline, section, research, section_research,
-                    draft["text"], **provider_args,
+                lambda: _verification_payload(
+                    generate_verified_section(
+                        work["topic"],
+                        outline,
+                        section,
+                        research,
+                        section_research,
+                        draft["text"],
+                        **provider_args,
+                    )
                 ),
             )
             _publish_verified_text(db_path, work_id, owner, epoch, segment_id, verification)
