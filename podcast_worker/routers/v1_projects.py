@@ -102,7 +102,7 @@ def _run_project_pipeline_with_slot(slot, *args) -> None:
 def _start_project_pipeline(args: tuple) -> None:
     thread = threading.Thread(
         target=_run_project_pipeline_with_slot,
-        args=args,
+        args=(_generation_slots, *args),
         daemon=True,
     )
     thread.start()

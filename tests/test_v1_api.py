@@ -19,6 +19,7 @@ from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
+from podcast_worker.routers.v1_projects import _start_project_pipeline as real_start_project_pipeline
 
 
 # ── Fixtures ──────────────────────────────────────────────────────────────
@@ -209,6 +210,28 @@ class TestAuth:
         resp = client.get("/api/v1/projects", headers=auth_headers)
         assert resp.status_code == 200
 
+
+def test_pipeline_thread_receives_generation_slot(monkeypatch):
+    from podcast_worker.routers import v1_projects
+
+    captured = {}
+
+    class FakeThread:
+        def __init__(self, *, target, args, daemon):
+            captured.update(target=target, args=args, daemon=daemon)
+
+        def start(self):
+            captured["started"] = True
+
+    monkeypatch.setattr(v1_projects.threading, "Thread", FakeThread)
+    pipeline_args = ("db", "work", "owner", 1, "output")
+
+    real_start_project_pipeline(pipeline_args)
+
+    assert captured["target"] is v1_projects._run_project_pipeline_with_slot
+    assert captured["args"] == (v1_projects._generation_slots, *pipeline_args)
+    assert captured["daemon"] is True
+    assert captured["started"] is True
 
 # ── Projects CRUD ─────────────────────────────────────────────────────────
 
