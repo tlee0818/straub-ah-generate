@@ -6,12 +6,59 @@ point that delegates to a shared provider client.
 """
 
 import json
+import math
 from dataclasses import dataclass
-from typing import Literal
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 from . import config
 from .config import ResolvedExecutionSnapshot, RoutingConfigurationError
+
+
+_VALID_SEGMENT_TYPES = frozenset({"intro", "content", "outro"})
+
+
+def required_segment_count(duration_minutes: int) -> int:
+    """Return the server-owned, bounded segment count for a valid duration."""
+    if isinstance(duration_minutes, bool) or not isinstance(duration_minutes, int):
+        raise ValueError("duration_minutes must be an integer")
+    if not 1 <= duration_minutes <= 30:
+        raise ValueError("duration_minutes must be between 1 and 30")
+    return min(max(math.ceil(duration_minutes / 2), 1), 12)
+
+
+def validate_script_outline(outline: dict, duration_minutes: int) -> dict:
+    """Validate provider outline shape without trimming, padding, or coercion."""
+    expected_count = required_segment_count(duration_minutes)
+    if not isinstance(outline, dict):
+        raise ValueError("outline must be an object")
+    if not isinstance(outline.get("title"), str) or not outline["title"].strip():
+        raise ValueError("outline title must be nonblank")
+
+    sections = outline.get("sections")
+    if not isinstance(sections, list) or len(sections) != expected_count:
+        raise ValueError(f"outline must contain exactly {expected_count} sections")
+
+    for expected_index, section in enumerate(sections):
+        if not isinstance(section, dict):
+            raise ValueError(f"outline section {expected_index} must be an object")
+        if section.get("index") != expected_index:
+            raise ValueError("outline section indices must be contiguous from zero")
+        if section.get("segment_type") not in _VALID_SEGMENT_TYPES:
+            raise ValueError(f"outline section {expected_index} has invalid segment_type")
+        for field in ("topic", "title"):
+            value = section.get(field)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(f"outline section {expected_index} {field} must be nonblank")
+        planned_duration = section.get("approx_duration_seconds")
+        if (
+            isinstance(planned_duration, bool)
+            or not isinstance(planned_duration, (int, float))
+            or planned_duration <= 0
+        ):
+            raise ValueError(
+                f"outline section {expected_index} approx_duration_seconds must be positive"
+            )
+    return outline
 
 
 # ---------------------------------------------------------------------------
@@ -151,34 +198,38 @@ Important rules:
 
 def _get_outline_prompt(topic: str, bpm: int, duration_minutes: int = 5) -> str:
     """Build the outline prompt for the first LLM step."""
+    segment_count = required_segment_count(duration_minutes)
     style_context = _get_script_style_context(bpm, duration_minutes)
 
-    return f"""You are planning a {duration_minutes}-minute solo educational podcast.
+    return f"""You are planning a {duration_minutes}-minute educational dialogue podcast built around natural host/guest conversation.
 
 TOPIC: {topic}
 {style_context}
 
-Create a section outline before any script text is written. The outline should include a hook/intro, several content sections, and an outro. Each section topic should be specific enough that it can be written independently while still fitting the full episode. Plan a progression that can support a natural host/guest conversation, including callback opportunities between sections where useful, but do not write dialogue or stage directions in the outline.
+Create exactly {segment_count} ordered sections before any script text is written. The sections together must cover the full {duration_minutes}-minute target duration. Do not add, omit, merge, or pad sections.
+Plan the conversation only; do not write dialogue or stage directions.
 
 Return ONLY valid JSON with this exact structure:
 {{
     "title": "Episode title",
     "sections": [
         {{
+            "index": 0,
             "segment_type": "intro",
-            "topic": "Section topic",
-            "approx_duration_seconds": 30
-        }},
-        {{
-            "segment_type": "content",
-            "topic": "Section topic",
-            "approx_duration_seconds": 45
+            "topic": "Specific section topic",
+            "title": "Section title",
+            "approx_duration_seconds": 60
         }}
     ]
 }}
 
-The total of approx_duration_seconds should be about {duration_minutes * 60}.
-Each content section should be 30-60 seconds of natural speech.
+Requirements:
+- sections contains exactly {segment_count} objects
+- index values are exactly 0 through {segment_count - 1}, in order
+- segment_type is exactly intro, content, or outro
+- topic and title are nonblank
+- approx_duration_seconds is positive
+- total target duration is about {duration_minutes * 60} seconds
 """
 
 
@@ -459,9 +510,9 @@ def generate_script_outline(
     snapshot: ResolvedExecutionSnapshot | None = None,
     **kwargs,
 ) -> dict:
-    """Generate a podcast section outline without writing full script text."""
+    """Generate and strictly validate a podcast section outline."""
     outline_prompt = _get_outline_prompt(topic, bpm, duration_minutes)
-    return _call_provider(
+    outline = _call_provider(
         "You are a podcast outline planner. You output raw JSON only.",
         outline_prompt,
         provider=provider,
@@ -469,6 +520,7 @@ def generate_script_outline(
         purpose="outline",
         **kwargs,
     )
+    return validate_script_outline(outline, duration_minutes)
 
 
 def generate_research_brief(
@@ -509,6 +561,66 @@ def generate_subtopic_research(
         purpose="subtopic_research",
         **kwargs,
     )
+
+
+def generate_section_draft(
+    topic: str,
+    bpm: int,
+    duration_minutes: int,
+    outline: dict,
+    section: dict,
+    research_brief: dict,
+    section_research: dict,
+    previous_section_text: str = "",
+    interviewer_profile: Optional[dict] = None,
+    sme_profile: Optional[dict] = None,
+    provider: Optional[str] = None,
+    **kwargs,
+) -> dict:
+    """Generate one internal section draft for durable staged execution."""
+    sections = outline.get("sections", [])
+    try:
+        index = sections.index(section)
+    except ValueError as exc:
+        raise ValueError("section is not part of the accepted outline") from exc
+    prompt = _get_section_prompt(
+        topic,
+        bpm,
+        outline,
+        section,
+        sections[index - 1] if index > 0 else None,
+        sections[index + 1] if index + 1 < len(sections) else None,
+        previous_section_text,
+        research_brief,
+        section_research,
+        interviewer_profile,
+        sme_profile,
+        duration_minutes,
+    )
+    result = _call_provider(
+        "You are a podcast script writer. You output raw JSON only.",
+        prompt,
+        provider=provider,
+        **kwargs,
+    )
+    segment = result.get("segment", result)
+    text = segment.get("text") if isinstance(segment, dict) else None
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError("section draft must contain nonblank text")
+    return segment
+
+
+def validated_fact_check_result(result: dict) -> dict:
+    """Validate verifier output before any public text is persisted."""
+    if not isinstance(result, dict) or not isinstance(result.get("is_factful"), bool):
+        raise ValueError("fact check result is malformed")
+    issues = result.get("issues")
+    if not isinstance(issues, list) or any(not isinstance(issue, str) for issue in issues):
+        raise ValueError("fact check issues must be a string array")
+    verified_text = result.get("verified_text")
+    if not isinstance(verified_text, str) or not verified_text.strip():
+        raise ValueError("fact check result must contain nonblank verified_text")
+    return result
 
 
 def _get_fact_check_prompt(
@@ -555,6 +667,12 @@ class VerificationResult:
 
 def parse_verification_result(value: dict[str, Any], draft: str) -> VerificationResult:
     """Strict verifier gate: no unverified draft can reach TTS."""
+    if "outcome" not in value and isinstance(value.get("is_factful"), bool):
+        value = {
+            "outcome": "accepted" if value["is_factful"] else "blocked",
+            "issues": value.get("issues", []),
+            "verified_text": value.get("verified_text") if value["is_factful"] else None,
+        }
     outcome = value.get("outcome")
     issues = value.get("issues")
     verified_text = value.get("verified_text")
@@ -591,6 +709,29 @@ def verify_section_factfulness(
         **kwargs,
     )
     return parse_verification_result(value, generated_text)
+
+
+def generate_verified_section(
+    topic: str,
+    outline: dict,
+    section: dict,
+    research_brief: dict,
+    section_research: dict,
+    generated_text: str,
+    provider: Optional[str] = None,
+    **kwargs,
+) -> VerificationResult:
+    """Verify one draft and reject malformed results before publication."""
+    return verify_section_factfulness(
+        topic=topic,
+        outline=outline,
+        section=section,
+        research_brief=research_brief,
+        section_research=section_research,
+        generated_text=generated_text,
+        provider=provider,
+        **kwargs,
+    )
 
 
 def generate_script(
@@ -641,43 +782,34 @@ def generate_script(
     previous_section_text = ""
 
     for index, section in enumerate(sections):
-        previous_section = sections[index - 1] if index > 0 else None
-        next_section = sections[index + 1] if index + 1 < len(sections) else None
-        section_prompt = _get_section_prompt(
-            topic,
-            bpm,
-            outline,
-            section,
-            previous_section,
-            next_section,
-            previous_section_text,
-            research_brief,
-            section_research_items[index],
-            interviewer_profile,
-            sme_profile,
-            duration_minutes,
-        )
-        generated_section = _call_provider(
-            "You are a podcast script writer. You output raw JSON only.",
-            section_prompt,
+        segment = generate_section_draft(
+            topic=topic,
+            bpm=bpm,
+            duration_minutes=duration_minutes,
+            outline=outline,
+            section=section,
+            research_brief=research_brief,
+            section_research=section_research_items[index],
+            previous_section_text=previous_section_text,
+            interviewer_profile=interviewer_profile,
+            sme_profile=sme_profile,
             provider=provider,
             snapshot=snapshot,
             purpose="dialogue_draft",
             **kwargs,
         )
-        segment = generated_section.get("segment", generated_section)
-        verification = verify_section_factfulness(
+        verification = generate_verified_section(
             topic=topic,
             outline=outline,
             section=section,
             research_brief=research_brief,
             section_research=section_research_items[index],
-            generated_text=segment.get("text", ""),
+            generated_text=segment["text"],
             provider=provider,
             snapshot=snapshot,
             **kwargs,
         )
-        if verification.outcome == "blocked":
+        if verification.outcome == "blocked" or verification.verified_text is None:
             raise RoutingConfigurationError("validation_failed")
         generated_segments.append(
             {

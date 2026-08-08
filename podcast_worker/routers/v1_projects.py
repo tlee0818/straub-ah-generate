@@ -16,6 +16,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import JSONResponse
 
 from podcast_worker.core import persistence
 from podcast_worker.core.auth import require_auth
@@ -27,14 +28,17 @@ from podcast_worker.core.config import (
     validate_profile_pair,
 )
 from podcast_worker.core.script_generator import generate_script_outline
+from podcast_worker.core.observability import log_event, metrics
 from podcast_worker.core.models_v1 import (
     ErrorEnvelope,
     ErrorResponse,
     PodcastProjectResponse,
     OutlinePreviewResponse,
     OutlinePreviewRequest,
+    OutlinePreviewResponse,
     ProjectCreateRequest,
     ProjectCreateResponse,
+    ProjectCancellationResponse,
     ProjectDeleteResponse,
     ProjectOutlineResponse,
     ProjectListResponse,
@@ -95,6 +99,15 @@ def _run_project_pipeline_with_slot(slot, *args) -> None:
         slot.release()
 
 
+def _start_project_pipeline(args: tuple) -> None:
+    thread = threading.Thread(
+        target=_run_project_pipeline_with_slot,
+        args=args,
+        daemon=True,
+    )
+    thread.start()
+
+
 def _project_not_found(project_id: str) -> HTTPException:
     return HTTPException(
         status_code=404,
@@ -145,6 +158,7 @@ def _outline_response_to_generator(outline: ProjectOutlineResponse | None) -> di
         "title": outline.title,
         "sections": [
             {
+                "index": section.index,
                 "segment_type": section.segment_type,
                 "topic": section.topic,
                 "title": section.title,
@@ -166,54 +180,43 @@ async def preview_project_outline(
     req: OutlinePreviewRequest,
     owner_id: str = Depends(require_auth),
 ):
-    """Generate a reviewable outline with a durable paired safe-profile binding."""
-    try:
-        llm = resolve_llm_profile(req.llm_profile_id)
-        tts = resolve_tts_profile(req.tts_profile_id)
-        validate_profile_pair(llm, tts)
-    except RoutingConfigurationError as exc:
-        raise _routing_error(exc, str(exc) == "incompatible_generation_profiles") from exc
-    llm_profile_id, tts_profile_id = llm.profile_id, tts.profile_id
-    preview_id, ledger_id, attempt_id = _short_id("opv"), _short_id("led"), _short_id("att")
-    routing_revision, tts_routing_revision = llm.revision, tts.revision
-    llm_payload, tts_payload = _llm_snapshot_payload(llm), _tts_snapshot_payload(tts)
-    llm_snapshot = {"snapshot_id": _short_id("lsn"), "profile_id": llm_profile_id, "revision": routing_revision,
-                    "payload": llm_payload, "sha256": hashlib.sha256(json.dumps(llm_payload, sort_keys=True).encode()).hexdigest()}
-    tts_snapshot = {"snapshot_id": _short_id("tsn"), "profile_id": tts_profile_id, "revision": tts_routing_revision,
-                    "payload": tts_payload, "sha256": hashlib.sha256(json.dumps(tts_payload, sort_keys=True).encode()).hexdigest()}
-    expires_at = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
-    policy = {"mode": llm.budget.mode, "caps": dict(llm.budget.caps), "pricing": dict(llm.budget.pricing)}
-    await persistence.create_preview_binding(_db_path(), {
-        "outline_preview_id": preview_id, "owner_id": owner_id, "topic": req.topic, "bpm": req.bpm,
-        "duration_minutes": req.duration_minutes, "outline": {}, "llm_profile_id": llm_profile_id,
-        "tts_profile_id": tts_profile_id, "routing_revision": routing_revision,
-        "tts_routing_revision": tts_routing_revision, "expires_at": expires_at,
-    }, llm_snapshot, tts_snapshot, {"ledger_id": ledger_id, "policy": policy, "currency": llm.budget.currency})
-    reservation = {"entry_id": _short_id("ledent"), "ledger_id": ledger_id, "category": "llm",
-                   "operation_type": "outline", "correlation_id": preview_id, "resource_unit": "request",
-                   "amount": 1, "pricing": dict(llm.budget.pricing)}
-    accepted = await persistence.reserve_ledger_operation(_db_path(), reservation, {
-        "attempt_id": attempt_id, "snapshot_revision": routing_revision,
-        "binding": {"purpose": "outline", "provider": llm.route_for("outline").provider, "model": llm.route_for("outline").model},
-    })
-    if not accepted:
-        raise HTTPException(status_code=409, detail=ErrorEnvelope(error=ErrorResponse(
-            code="generation_budget_exhausted", message="Generation budget is unavailable."
-        )).model_dump())
-    try:
-        outline = generate_script_outline(topic=req.topic, bpm=req.bpm, duration_minutes=req.duration_minutes, snapshot=llm)
-    except Exception as exc:
-        await persistence.settle_ledger_operation(_db_path(), ledger_id, attempt_id, {**reservation, "entry_id": _short_id("ledent")},
-                                                  "failed", error={"code": "outline_failed"})
-        raise
-    response = _outline_response_from_generator(req.topic, outline)
-    await persistence.update_preview_outline(_db_path(), preview_id, response.model_dump())
-    await persistence.settle_ledger_operation(_db_path(), ledger_id, attempt_id, {**reservation, "entry_id": _short_id("ledent")},
-                                              "succeeded")
-    return OutlinePreviewResponse(**response.model_dump(), outline_preview_id=preview_id,
-                                  llm_profile_id=llm_profile_id, tts_profile_id=tts_profile_id,
-                                  routing_revision=routing_revision, tts_routing_revision=tts_routing_revision,
-                                  expires_at=expires_at)
+    """Generate and persist a one-time reviewable outline binding."""
+    llm_snapshot = resolve_llm_profile(req.llm_profile_id)
+    tts_snapshot = resolve_tts_profile(req.tts_profile_id)
+    provider = llm_snapshot.route_for("outline").provider
+    model = llm_snapshot.route_for("outline").model
+    outline = generate_script_outline(
+        topic=req.topic,
+        bpm=req.bpm,
+        duration_minutes=req.duration_minutes,
+        provider=provider,
+        model=model,
+    )
+    response_outline = _outline_response_from_generator(req.topic, outline)
+    binding = await persistence.create_outline_preview_binding(
+        _db_path(),
+        _short_id("opv"),
+        owner_id,
+        req.topic,
+        req.bpm,
+        req.duration_minutes,
+        _outline_response_to_generator(response_outline),
+        llm_snapshot.profile_id,
+        tts_snapshot.profile_id,
+        llm_snapshot.revision,
+        tts_snapshot.revision,
+        (datetime.now(timezone.utc) + timedelta(minutes=15)).isoformat(),
+    )
+    return OutlinePreviewResponse(
+        **response_outline.model_dump(),
+        binding=binding,
+        outline_preview_id=binding["outline_preview_id"],
+        llm_profile_id=binding["llm_profile_id"],
+        tts_profile_id=binding["tts_profile_id"],
+        routing_revision=binding["llm_routing_revision"],
+        tts_routing_revision=binding["tts_routing_revision"],
+        expires_at=binding["expires_at"],
+    )
 
 
 
@@ -222,92 +225,80 @@ async def create_project(
     req: ProjectCreateRequest,
     owner_id: str = Depends(require_auth),
 ):
-    """Create a durable PodcastProject and start backend generation."""
-    interviewer_voice_id = req.interviewer_profile.voice_id if req.interviewer_profile else None
-    guest_voice_id = req.sme_profile.voice_id if req.sme_profile else None
-    try:
-        llm = resolve_llm_profile(req.llm_profile_id)
-        tts = resolve_tts_profile(req.tts_profile_id, interviewer_voice_id, guest_voice_id)
-        validate_profile_pair(llm, tts)
-    except RoutingConfigurationError as exc:
-        raise _routing_error(exc, str(exc) == "incompatible_generation_profiles") from exc
-    llm_profile_id, tts_profile_id = llm.profile_id, tts.profile_id
-    routing_revision, tts_routing_revision = llm.revision, tts.revision
-    preview = None
-    if req.outline_preview_id:
-        preview = await persistence.get_preview_binding(_db_path(), req.outline_preview_id, owner_id)
-        if preview is None or preview.get("consumed_at") is not None or preview.get("expires_at", "") <= datetime.now(timezone.utc).isoformat():
-            raise HTTPException(status_code=409, detail=ErrorEnvelope(error=ErrorResponse(
-                code="preview_expired" if preview else "preview_not_found",
-                message="The outline preview is no longer available."
-            )).model_dump())
-        if not preview.get("tts_snapshot_id"):
-            raise HTTPException(status_code=409, detail=ErrorEnvelope(error=ErrorResponse(
-                code="preview_binding_required", message="This outline preview must be regenerated."
-            )).model_dump())
-        if (preview["topic"], preview["bpm"], preview["duration_minutes"], preview["llm_profile_id"],
-            preview["tts_profile_id"], preview["routing_revision"], preview["tts_routing_revision"]) != (
-                req.topic, req.bpm, req.duration_minutes, llm_profile_id, tts_profile_id,
-                routing_revision, tts_routing_revision):
-            raise HTTPException(status_code=409, detail=ErrorEnvelope(error=ErrorResponse(
-                code="preview_profile_mismatch", message="The selected generation request differs from the preview."
-            )).model_dump())
+    """Atomically create a durable project before scheduling generation."""
     project_id = _short_id("prj")
     db = _db_path()
     if not _generation_slots.acquire(blocking=False):
         raise HTTPException(status_code=503, detail="Generation capacity is full.")
-    project = await persistence.create_project(db, project_id, owner_id, req.topic, req.bpm, req.duration_minutes)
-    if preview:
-        result = await persistence.consume_preview_binding(
-            db, req.outline_preview_id, owner_id, project_id, req.topic, req.bpm, req.duration_minutes,
-            llm_profile_id, tts_profile_id, routing_revision, tts_routing_revision,
-        )
-        if result != "ok":
-            await persistence.delete_project(db, project_id)
-            _generation_slots.release()
-            raise HTTPException(status_code=409, detail=ErrorEnvelope(error=ErrorResponse(
-                code=result, message="The outline preview could not be consumed."
-            )).model_dump())
-    if preview:
-        ledger_id = preview["ledger_id"]
-    else:
-        llm_payload, tts_payload = _llm_snapshot_payload(llm), _tts_snapshot_payload(tts)
-        llm_snapshot = {"snapshot_id": _short_id("lsn"), "profile_id": llm_profile_id,
-                        "revision": routing_revision, "payload": llm_payload,
-                        "sha256": hashlib.sha256(json.dumps(llm_payload, sort_keys=True).encode()).hexdigest()}
-        tts_snapshot = {"snapshot_id": _short_id("tsn"), "profile_id": tts_profile_id,
-                        "revision": tts_routing_revision, "payload": tts_payload,
-                        "sha256": hashlib.sha256(json.dumps(tts_payload, sort_keys=True).encode()).hexdigest()}
-        ledger_id = _short_id("led")
-        await persistence.create_project_execution(db, project_id, owner_id, llm_snapshot, tts_snapshot, {
-            "ledger_id": ledger_id,
-            "policy": {"mode": llm.budget.mode, "caps": dict(llm.budget.caps), "pricing": dict(llm.budget.pricing)},
-            "currency": llm.budget.currency,
-        })
-    await persistence.upsert_durable_record(db, "work_items", {
-        "work_id": _short_id("wrk"), "project_id": project_id, "ledger_id": ledger_id,
-        "kind": "project_pipeline", "state": "pending",
-        "payload_json": {"llm_profile_id": llm_profile_id, "tts_profile_id": tts_profile_id,
-                         "routing_revision": routing_revision, "tts_routing_revision": tts_routing_revision},
-    })
-    await persistence.claim_reconcilable_work(
-        db, "work_items", f"request:{project_id}",
-        (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat(),
-    )
 
-    # Start background segment generation in a daemon thread
     outline = _outline_response_to_generator(req.approved_outline)
+    outline_preview_id = req.outline_preview_id
+    if outline is None or outline_preview_id is None:
+        _generation_slots.release()
+        raise HTTPException(
+            status_code=409,
+            detail=ErrorEnvelope(
+                error=ErrorResponse(
+                    code="preview_binding_not_found",
+                    message="A caller-reviewed outline preview binding is required.",
+                )
+            ).model_dump(),
+        )
+
     interviewer_profile = req.interviewer_profile.model_dump(exclude_none=True) if req.interviewer_profile else None
     sme_profile = req.sme_profile.model_dump(exclude_none=True) if req.sme_profile else None
-    slot = _generation_slots
-    thread = threading.Thread(
-        target=_run_project_pipeline_with_slot,
-        args=(slot, db, project_id, _output_dir(), req.topic,
-              req.bpm, req.duration_minutes, req.voice_id, outline,
-              interviewer_profile, sme_profile),
-        daemon=True,
+    llm_snapshot = resolve_llm_profile(req.llm_profile_id)
+    tts_snapshot = resolve_tts_profile(req.tts_profile_id)
+    try:
+        project = await persistence.create_progress_project(
+            db,
+            project_id,
+            owner_id,
+            req.topic,
+            req.bpm,
+            req.duration_minutes,
+            outline,
+            interviewer_profile,
+            sme_profile,
+            llm_snapshot.profile_id,
+            tts_snapshot.profile_id,
+            outline_preview_id,
+        )
+    except ValueError as exc:
+        _generation_slots.release()
+        code = str(exc)
+        if code.startswith("preview_binding_"):
+            raise HTTPException(
+                status_code=409,
+                detail=ErrorEnvelope(
+                    error=ErrorResponse(code=code, message="Outline preview binding is invalid.")
+                ).model_dump(),
+            ) from exc
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except Exception:
+        _generation_slots.release()
+        raise
+
+    work_id = f"work_{uuid.uuid5(uuid.NAMESPACE_URL, f'{project_id}:pipeline').hex}"
+    lease_owner = _short_id("worker")
+    claim = await persistence.claim_next_work(
+        db,
+        lease_owner,
+        settings.work_lease_seconds,
+        work_id,
     )
-    thread.start()
+    if claim is None:
+        _generation_slots.release()
+        raise HTTPException(status_code=503, detail="Generation work could not be claimed.")
+    _start_project_pipeline(
+        (
+            db,
+            claim["work_id"],
+            claim["lease_owner"],
+            claim["lease_epoch"],
+            _output_dir(),
+        )
+    )
 
     response_project = PodcastProjectResponse(**project)
     return ProjectCreateResponse(
@@ -364,10 +355,10 @@ async def get_project_outline(project_id: str, owner_id: str = Depends(require_a
             {
                 "index": seg["index"],
                 "segment_id": seg["segment_id"],
-                "segment_type": "content",
+                "segment_type": seg.get("segment_type", "content"),
                 "topic": seg["subtopic"],
                 "title": seg.get("title"),
-                "approx_duration_seconds": seg.get("duration_seconds"),
+                "approx_duration_seconds": seg.get("planned_duration_seconds"),
             }
         )
 
@@ -379,6 +370,53 @@ async def get_project_outline(project_id: str, owner_id: str = Depends(require_a
         sections=sections,
     )
 
+
+@router.post("/{project_id}/cancel", response_model=ProjectCancellationResponse)
+async def cancel_project(project_id: str, owner_id: str = Depends(require_auth)):
+    """Request two-phase cancellation and return the canonical project snapshot."""
+    try:
+        result = await persistence.request_project_cancellation(
+            _db_path(), project_id, owner_id
+        )
+    except ValueError as exc:
+        if str(exc) != "project_not_cancellable":
+            raise
+        raise HTTPException(
+            status_code=409,
+            detail=ErrorEnvelope(
+                error=ErrorResponse(
+                    code="project_not_cancellable",
+                    message="Project is already terminal and cannot be cancelled.",
+                    details={"project_id": project_id},
+                )
+            ).model_dump(),
+        ) from exc
+    if result is None:
+        raise _project_not_found(project_id)
+
+    metrics.increment(
+        "podcast_cancel_requests_total",
+        outcome=result["state"],
+        route="project_cancel",
+    )
+    log_event(
+        "cancel_request",
+        project_id=project_id,
+        outcome=result["state"],
+        progress_version=result["project"]["generation_progress"]["progress_version"],
+    )
+    response = ProjectCancellationResponse(
+        project=PodcastProjectResponse(**result["project"]),
+        cancellation={
+            "state": result["state"],
+            "requested_at": result["requested_at"],
+            "observed_at": result["observed_at"],
+        },
+    )
+    return JSONResponse(
+        status_code=result["http_status"],
+        content=response.model_dump(mode="json"),
+    )
 
 # ═══════════════════════════════════════════════════════════════════════════
 # DELETE /api/v1/projects/{project_id}

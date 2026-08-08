@@ -31,6 +31,8 @@ from fastapi.responses import FileResponse, JSONResponse
 
 # Import core modules
 from podcast_worker.core import config as cfg
+from podcast_worker.core import persistence
+from podcast_worker.core.segment_pipeline import run_project_pipeline
 from podcast_worker.core.exceptions import (
     PodcastWorkerError,
     ConfigurationError,
@@ -89,6 +91,32 @@ class AppState:
 state = AppState()
 
 
+def _start_one_durable_work(work_id: str | None = None) -> bool:
+    """Claim and launch at most one pending/expired durable work item."""
+    owner = f"worker_{uuid.uuid4().hex}"
+    claim = persistence._claim_next_work(
+        cfg.settings.db_path,
+        owner,
+        cfg.settings.work_lease_seconds,
+        work_id,
+    )
+    if claim is None:
+        return False
+    threading.Thread(
+        target=run_project_pipeline,
+        args=(
+            cfg.settings.db_path,
+            claim["work_id"],
+            claim["lease_owner"],
+            claim["lease_epoch"],
+            str(state.output_dir),
+        ),
+        daemon=True,
+        name=f"pipeline-{claim['work_id']}",
+    ).start()
+    return True
+
+
 # ---------------------------------------------------------------------------
 # Lifespan
 # ---------------------------------------------------------------------------
@@ -99,21 +127,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Application lifespan — startup/shutdown logic."""
     state.start_time = time.time()
     state.output_dir.mkdir(parents=True, exist_ok=True)
-    lease_expires_at = (datetime.now(timezone.utc) + timedelta(minutes=10)).isoformat()
-    claimed = await persistence.claim_reconcilable_work(cfg.settings.db_path, "work_items", "startup", lease_expires_at)
-    for item in claimed:
-        if item["kind"] != "project_pipeline" or not item.get("project_id"):
-            continue
-        project = await persistence.get_project(cfg.settings.db_path, item["project_id"])
-        if project is None:
-            continue
-        thread = threading.Thread(
-            target=run_project_pipeline,
-            args=(cfg.settings.db_path, project["project_id"], str(state.output_dir), project["topic"],
-                  project["bpm"], project["duration_minutes"], None),
-            daemon=True,
-        )
-        thread.start()
+    _start_one_durable_work()
     yield
     # Cleanup on shutdown (if needed)
 
@@ -149,6 +163,7 @@ app.add_middleware(
 from podcast_worker.routers import v1_health, v1_projects, v1_artifacts
 
 app.include_router(v1_health.router)
+app.include_router(v1_health.internal_router)
 app.include_router(v1_projects.router)
 app.include_router(v1_artifacts.router)
 
@@ -185,6 +200,12 @@ async def v1_http_exception_handler(request: Request, exc: HTTPException):
     wrap v1 paths in the standard error envelope."""
     path = request.url.path
     if path.startswith("/api/v1/"):
+        if (
+            isinstance(exc.detail, dict)
+            and isinstance(exc.detail.get("error"), dict)
+            and isinstance(exc.detail["error"].get("code"), str)
+        ):
+            return JSONResponse(status_code=exc.status_code, content=exc.detail)
         # Map status code to error code
         code_map = {
             400: "bad_request",

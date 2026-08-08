@@ -9,7 +9,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, StrictInt, model_validator
 
 from podcast_worker.core.config import settings
 
@@ -23,6 +23,16 @@ SegmentStatus = str   # queued | scripting | validating | tts | mixing | ready |
 ValidationStatus = str  # pending | validated | needs_review | failed
 ArtifactKind = str     # segment_audio | final_mp3 | script_json
 ArtifactStatus = str   # pending | ready | failed | deleted
+
+GenerationStageName = str  # research | text_generation | fact_checking | tts | mixing | finalizing
+GenerationStageState = str  # pending | running | completed | failed | cancelled
+GenerationDisposition = str  # active | cancellation_requested | terminal
+TerminalOutcome = str  # ready | failed | cancelled
+
+
+def required_segment_count(duration_minutes: int) -> int:
+    """Return the server-owned, bounded segment count for a valid duration."""
+    return min(max((duration_minutes + 1) // 2, 1), 12)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -47,12 +57,74 @@ class SegmentError(BaseModel):
     retryable: bool = Field(default=False, description="Whether this error is retryable")
 
 
+class GenerationStageProgress(BaseModel):
+    name: GenerationStageName
+    state: GenerationStageState
+    completed_units: int = Field(..., ge=0)
+    total_units: int = Field(..., gt=0)
+    current_segment_id: Optional[str] = None
+    updated_at: str
+
+    @model_validator(mode="after")
+    def validate_counter(self) -> "GenerationStageProgress":
+        if self.completed_units > self.total_units:
+            raise ValueError("completed_units must not exceed total_units")
+        return self
+
+
+class GenerationActivity(BaseModel):
+    kind: str  # stage | cancellation
+    stage: Optional[GenerationStageName] = None
+    segment_id: Optional[str] = None
+
+
+class GenerationProgress(BaseModel):
+    schema_version: int = 1
+    progress_version: int = Field(..., ge=0)
+    disposition: GenerationDisposition
+    terminal_outcome: Optional[TerminalOutcome] = None
+    is_terminal: bool
+    planned_segment_count: int = Field(..., ge=1)
+    cancellation_requested_at: Optional[str] = None
+    terminal_at: Optional[str] = None
+    last_transition_at: str
+    current_activity: Optional[GenerationActivity] = None
+    stages: list[GenerationStageProgress]
+
+    @model_validator(mode="after")
+    def validate_snapshot(self) -> "GenerationProgress":
+        expected = {
+            "research",
+            "text_generation",
+            "fact_checking",
+            "tts",
+            "mixing",
+            "finalizing",
+        }
+        names = [stage.name for stage in self.stages]
+        if len(names) != len(expected) or set(names) != expected:
+            raise ValueError("generation progress must contain every canonical stage exactly once")
+        if self.is_terminal != (self.disposition == "terminal"):
+            raise ValueError("terminal disposition and is_terminal must agree")
+        if self.is_terminal != (self.current_activity is None):
+            raise ValueError("current_activity must be null exactly for terminal progress")
+        return self
+
+
+class CancellationState(BaseModel):
+    state: str
+    requested_at: str
+    observed_at: Optional[str] = None
+
+
 class Segment(BaseModel):
     """Sub-topic-level generation and playback unit."""
     segment_id: str = Field(..., description="Stable segment identifier")
-    index: int = Field(..., description="Playback order within the project")
-    subtopic: str = Field(..., description="Segment topic derived from project outline")
+    index: int = Field(..., ge=0, description="Playback order within the project")
+    subtopic: str = Field(..., min_length=1, description="Segment topic derived from project outline")
     title: Optional[str] = Field(default=None, description="User-facing segment title")
+    segment_type: str = Field(default="content", description="intro | content | outro")
+    planned_duration_seconds: Optional[float] = Field(default=None, gt=0)
     status: SegmentStatus = Field(default="queued", description="Segment lifecycle status")
     duration_seconds: Optional[float] = Field(default=None, description="Known after audio artifact creation")
     text: Optional[str] = Field(default=None, description="Generated segment script text")
@@ -66,12 +138,12 @@ class Segment(BaseModel):
 
 class OutlineSection(BaseModel):
     """One planned script section derived from project segments."""
-    index: int = Field(..., description="Playback order within the project")
+    index: int = Field(..., ge=0, description="Playback order within the project")
     segment_id: Optional[str] = Field(default=None, description="Segment id when the section has been created")
-    segment_type: str = Field(default="content", description="intro | content | outro")
-    topic: str = Field(..., description="Planned section topic")
-    title: Optional[str] = Field(default=None, description="User-facing section title")
-    approx_duration_seconds: Optional[float] = Field(default=None, description="Planned or generated section duration")
+    segment_type: str = Field(default="content", pattern="^(intro|content|outro)$", description="intro | content | outro")
+    topic: str = Field(..., min_length=1, description="Planned section topic")
+    title: str = Field(..., min_length=1, description="User-facing section title")
+    approx_duration_seconds: float = Field(..., gt=0, description="Planned section duration")
 
 
 class ProjectOutlineResponse(BaseModel):
@@ -80,6 +152,27 @@ class ProjectOutlineResponse(BaseModel):
     topic: str
     title: str
     sections: list[OutlineSection] = Field(default_factory=list)
+
+
+class OutlinePreviewBinding(BaseModel):
+    outline_preview_id: str
+    llm_profile_id: str
+    tts_profile_id: str
+    llm_routing_revision: str
+    tts_routing_revision: str
+    expires_at: str
+    request_hash: str
+    outline_hash: str
+
+
+class OutlinePreviewResponse(ProjectOutlineResponse):
+    binding: OutlinePreviewBinding
+    outline_preview_id: str
+    llm_profile_id: str
+    tts_profile_id: str
+    routing_revision: str
+    tts_routing_revision: str
+    expires_at: str
 
 
 class Artifact(BaseModel):
@@ -112,7 +205,7 @@ class OutlinePreviewRequest(BaseModel):
     """POST /api/v1/projects/outline-preview — generate a reviewable outline first."""
     topic: str = Field(..., min_length=1, max_length=200, description="Podcast topic")
     bpm: int = Field(..., ge=settings.min_bpm, le=settings.max_bpm, description="Beats per minute")
-    duration_minutes: int = Field(default=5, ge=1, le=30, description="Target duration in minutes")
+    duration_minutes: StrictInt = Field(default=5, ge=1, le=30, description="Target duration in minutes")
     llm_profile_id: Optional[str] = Field(default="default", description="Server-defined safe LLM profile id")
     tts_profile_id: Optional[str] = Field(default=None, description="Server-defined safe TTS profile id")
 
@@ -133,7 +226,7 @@ class ProjectCreateRequest(BaseModel):
     """POST /api/v1/projects — user intent only; provider secrets are server-side."""
     topic: str = Field(..., min_length=1, max_length=200, description="Podcast topic")
     bpm: int = Field(..., ge=settings.min_bpm, le=settings.max_bpm, description="Beats per minute")
-    duration_minutes: int = Field(default=5, ge=1, le=30, description="Target duration in minutes")
+    duration_minutes: StrictInt = Field(default=5, ge=1, le=30, description="Target duration in minutes")
     voice_id: Optional[str] = Field(default=None, description="Voice ID from /api/v1/config voices list")
     llm_profile_id: Optional[str] = Field(default="default", description="Server-defined safe LLM profile id")
     tts_profile_id: Optional[str] = Field(default="default", description="Server-defined safe TTS profile id")
@@ -141,6 +234,26 @@ class ProjectCreateRequest(BaseModel):
     approved_outline: Optional[ProjectOutlineResponse] = Field(default=None, description="User-reviewed outline to use for script generation")
     interviewer_profile: Optional[SpeakerProfile] = Field(default=None, description="Interviewer voice, tone, humor, and style")
     sme_profile: Optional[SpeakerProfile] = Field(default=None, description="Subject matter expert guest voice, tone, humor, and expertise")
+    outline_preview_id: Optional[str] = Field(
+        default=None,
+        description="One-time server binding returned with the approved outline preview",
+    )
+
+    @model_validator(mode="after")
+    def validate_approved_outline(self) -> "ProjectCreateRequest":
+        if self.approved_outline is None:
+            return self
+        sections = self.approved_outline.sections
+        expected_count = required_segment_count(self.duration_minutes)
+        if len(sections) != expected_count:
+            raise ValueError(
+                f"approved outline must contain exactly {expected_count} sections"
+            )
+        if [section.index for section in sections] != list(range(expected_count)):
+            raise ValueError("approved outline section indices must be contiguous from zero")
+        if self.approved_outline.topic.strip() != self.topic.strip():
+            raise ValueError("approved outline topic must match the project topic")
+        return self
 
 
 class TransferUrlRequest(BaseModel):
@@ -170,6 +283,7 @@ class PodcastProjectResponse(BaseModel):
     created_at: str
     updated_at: str
     deleted_at: Optional[str] = None
+    generation_progress: Optional[GenerationProgress] = None
 
 
 class ProjectCreateResponse(BaseModel):
@@ -191,6 +305,7 @@ class ProjectSummary(BaseModel):
     final_download_ready: bool
     created_at: str
     updated_at: str
+    generation_progress: Optional[GenerationProgress] = None
 
 
 class ProjectListResponse(BaseModel):
@@ -203,6 +318,11 @@ class ProjectDeleteResponse(BaseModel):
     project_id: str
     status: str
     deleted_at: str
+
+
+class ProjectCancellationResponse(BaseModel):
+    project: PodcastProjectResponse
+    cancellation: CancellationState
 
 
 class TransferUrlResponse(BaseModel):
@@ -237,14 +357,6 @@ class VoiceProfile(BaseModel):
     roles: list[Literal["interviewer", "guest"]] = Field(default_factory=list)
 
 
-class OutlinePreviewResponse(ProjectOutlineResponse):
-    """Safe, immutable profile binding for an outline preview."""
-    outline_preview_id: str
-    llm_profile_id: str
-    tts_profile_id: str
-    routing_revision: str
-    tts_routing_revision: str
-    expires_at: str
 
 
 class ConfigResponse(BaseModel):

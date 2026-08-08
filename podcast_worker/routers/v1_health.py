@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import time
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Response
 
 from podcast_worker.core.auth import optional_auth, require_auth
 from podcast_worker.core.config import (
@@ -17,9 +17,10 @@ from podcast_worker.core.config import (
     llm_profile_document,
     resolve_llm_profile,
     resolve_tts_profile,
-    tts_profile_document,
     settings,
+    tts_profile_document,
 )
+from podcast_worker.core.observability import metrics
 from podcast_worker.core.models_v1 import (
     ConfigResponse,
     HealthResponse,
@@ -29,6 +30,14 @@ from podcast_worker.core.models_v1 import (
 )
 
 router = APIRouter(prefix="/api/v1", tags=["v1-health"])
+internal_router = APIRouter(prefix="/internal", tags=["internal"])
+
+
+@internal_router.get("/metrics", response_class=Response)
+async def internal_metrics(owner_id: str = Depends(require_auth)) -> Response:
+    """Return authenticated low-cardinality Prometheus metrics."""
+    del owner_id
+    return Response(content=metrics.render(), media_type="text/plain; version=0.0.4")
 
 _start_time = time.time()
 

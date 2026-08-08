@@ -179,9 +179,9 @@ class TestScriptGenerationFlow:
         outline = {
             "title": "AI Safety",
             "sections": [
-                {"segment_type": "intro", "topic": "Hook", "approx_duration_seconds": 30},
-                {"segment_type": "content", "topic": "Risk framing", "approx_duration_seconds": 45},
-                {"segment_type": "outro", "topic": "Takeaway", "approx_duration_seconds": 30},
+                {"index": 0, "segment_type": "intro", "topic": "Hook", "title": "Hook", "approx_duration_seconds": 30},
+                {"index": 1, "segment_type": "content", "topic": "Risk framing", "title": "Risk framing", "approx_duration_seconds": 45},
+                {"index": 2, "segment_type": "outro", "topic": "Takeaway", "title": "Takeaway", "approx_duration_seconds": 30},
             ],
         }
         research_brief = {
@@ -217,7 +217,7 @@ class TestScriptGenerationFlow:
         script = generate_script(
             "AI safety",
             128,
-            duration_minutes=4,
+            duration_minutes=5,
             provider="test-provider",
             model="test-model",
         )
@@ -337,8 +337,8 @@ class TestPipelineSegmentCreation:
         outline = {
             "title": "Test",
             "sections": [
-                {"segment_type": "intro", "topic": "Start", "approx_duration_seconds": 15},
-                {"segment_type": "content", "topic": "Middle", "approx_duration_seconds": 30},
+                {"index": 0, "segment_type": "intro", "topic": "Start", "title": "Start", "approx_duration_seconds": 15},
+                {"index": 1, "segment_type": "content", "topic": "Middle", "title": "Middle", "approx_duration_seconds": 30},
             ],
         }
         responses = [
@@ -356,13 +356,17 @@ class TestPipelineSegmentCreation:
             if "subtopic research agent" in system_prompt:
                 return {"key_points": ["Research point"]}
             if "factfulness verification agent" in system_prompt:
-                index = len([call for call in calls if "script writer" in call]) - 1
-                return {"outcome": "accepted", "issues": [], "verified_text": responses[index]["text"]}
+                index = len([call for call in calls if "factfulness verification agent" in call]) - 1
+                return {
+                    "is_factful": True,
+                    "issues": [],
+                    "verified_text": responses[index]["text"],
+                }
             return responses[len([call for call in calls if "script writer" in call]) - 1]
 
         monkeypatch.setattr(script_generator, "_call_provider", fake_call)
 
-        script = generate_script("test", 120)
+        script = generate_script("test", 120, duration_minutes=3)
         segments = script["segments"]
         assert len(segments) == 2
         for seg in segments:
@@ -376,7 +380,7 @@ class TestPipelineSegmentCreation:
         outline = {
             "title": "Full Episode Title",
             "sections": [
-                {"segment_type": "intro", "topic": "The Hook", "approx_duration_seconds": 10},
+                {"index": 0, "segment_type": "intro", "topic": "The Hook", "title": "The Hook", "approx_duration_seconds": 10},
             ],
         }
         monkeypatch.setattr(script_generator, "_call_provider", lambda *a, **kw: (
@@ -385,21 +389,25 @@ class TestPipelineSegmentCreation:
         ))
         calls = []
 
-        def fake_call(*a, **kw):
-            calls.append(1)
-            if "factfulness verification agent" in a[0]:
-                return {"outcome": "accepted", "issues": [], "verified_text": "Hook text."}
-            if len(calls) == 1:
+        def fake_call(system_prompt, *args, **kwargs):
+            calls.append(system_prompt)
+            if "outline planner" in system_prompt:
                 return outline
-            if "lead research agent" in a[0]:
+            if "lead research agent" in system_prompt:
                 return {"research_brief": "Brief"}
-            if "subtopic research agent" in a[0]:
+            if "subtopic research agent" in system_prompt:
                 return {"key_points": ["Research point"]}
+            if "factfulness verification agent" in system_prompt:
+                return {
+                    "is_factful": True,
+                    "issues": [],
+                    "verified_text": "Hook text.",
+                }
             return {"segment_type": "intro", "text": "Hook text.", "approx_duration_seconds": 10}
 
         monkeypatch.setattr(script_generator, "_call_provider", fake_call)
 
-        script = generate_script("test", 120)
+        script = generate_script("test", 120, duration_minutes=1)
         seg = script["segments"][0]
         assert seg["subtopic"] == "The Hook"
         assert seg["title"] == "The Hook"
@@ -409,9 +417,9 @@ class TestPipelineSegmentCreation:
         outline = {
             "title": "Context Test",
             "sections": [
-                {"segment_type": "intro", "topic": "A", "approx_duration_seconds": 10},
-                {"segment_type": "content", "topic": "B", "approx_duration_seconds": 20},
-                {"segment_type": "outro", "topic": "C", "approx_duration_seconds": 10},
+                {"index": 0, "segment_type": "intro", "topic": "A", "title": "A", "approx_duration_seconds": 10},
+                {"index": 1, "segment_type": "content", "topic": "B", "title": "B", "approx_duration_seconds": 20},
+                {"index": 2, "segment_type": "outro", "topic": "C", "title": "C", "approx_duration_seconds": 10},
             ],
         }
         section_texts = [
@@ -436,7 +444,7 @@ class TestPipelineSegmentCreation:
 
         monkeypatch.setattr(script_generator, "_call_provider", fake_call)
 
-        generate_script("context-topic", 100, duration_minutes=2)
+        generate_script("context-topic", 100, duration_minutes=5)
 
         # 3 section writing calls after outline and research calls
         assert len(prompts) == 3
@@ -468,7 +476,7 @@ class TestPipelineSegmentDataFlow:
         outline = {
             "title": "DB Shape Test",
             "sections": [
-                {"segment_type": "content", "topic": "Topic A", "approx_duration_seconds": 42},
+                {"index": 0, "segment_type": "content", "topic": "Topic A", "title": "Topic A", "approx_duration_seconds": 42},
             ],
         }
         monkeypatch.setattr(script_generator, "_call_provider", lambda *a, **kw: (
@@ -477,21 +485,25 @@ class TestPipelineSegmentDataFlow:
         ))
         calls = []
 
-        def fake_call(*a, **kw):
-            calls.append(1)
-            if "factfulness verification agent" in a[0]:
-                return {"outcome": "accepted", "issues": [], "verified_text": "Body text here."}
-            if len(calls) == 1:
+        def fake_call(system_prompt, *args, **kwargs):
+            calls.append(system_prompt)
+            if "outline planner" in system_prompt:
                 return outline
-            if "lead research agent" in a[0]:
+            if "lead research agent" in system_prompt:
                 return {"research_brief": "Brief"}
-            if "subtopic research agent" in a[0]:
+            if "subtopic research agent" in system_prompt:
                 return {"key_points": ["Research point"]}
+            if "factfulness verification agent" in system_prompt:
+                return {
+                    "is_factful": True,
+                    "issues": [],
+                    "verified_text": "Body text here.",
+                }
             return {"segment_type": "content", "text": "Body text here.", "approx_duration_seconds": 42}
 
         monkeypatch.setattr(script_generator, "_call_provider", fake_call)
 
-        script = generate_script("db-test", 120)
+        script = generate_script("db-test", 120, duration_minutes=1)
         seg = script["segments"][0]
 
         assert seg["text"] == "Body text here."

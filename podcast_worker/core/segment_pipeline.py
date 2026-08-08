@@ -1,38 +1,99 @@
-"""Background segment generation pipeline for PodcastProject v1.
+"""Durable, fenced project generation worker.
 
-Orchestrates the transition: queued → scripting → validating → tts → mixing → ready.
-
-Key invariants (per API_SPEC.md):
-- provenance.validation_status MUST be stored before a segment transitions to tts.
-- artifact metadata MUST be stored before segment transitions to ready.
-- Forced segment failure preserves ready artifacts; final_download_ready stays false.
+The worker consumes the plan and immutable inputs committed by project creation. It
+never creates or renumbers segments. Every externally visible write is guarded by
+the project-pipeline owner/epoch fence.
 """
-
 from __future__ import annotations
 
 import hashlib
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import os
-import threading
+import json
+import sqlite3
 import uuid
+import wave
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Optional
+from typing import Any
 
-from podcast_worker.core import config as cfg
-from podcast_worker.core import persistence
+import numpy as np
+
+from podcast_worker.core import config as cfg, persistence
 from podcast_worker.core.config import RoutingConfigurationError
-from podcast_worker.core.script_generator import generate_script
-from podcast_worker.core.tts_engine import synthesize, convert_to_wav
-from podcast_worker.core.beat_generator import save_beat_to_wav, generate_beat
-from podcast_worker.core.audio_mixer import (
-    _load_wav_to_numpy,
-    _save_numpy_to_wav,
-    build_podcast_audio,
-    convert_to_mp3,
-)
 from podcast_worker.core.exceptions import PodcastWorkerError
+from podcast_worker.core.audio_mixer import build_podcast_audio, convert_to_mp3
+from podcast_worker.core.beat_generator import save_beat_to_wav
+from podcast_worker.core.script_generator import (
+    generate_research_brief,
+    generate_section_draft,
+    generate_subtopic_research,
+    generate_verified_section,
+)
+from podcast_worker.core.tts_engine import convert_to_wav, synthesize
 
+
+class FenceLost(RuntimeError):
+    """The worker no longer owns its durable work lease."""
+
+
+class PipelineInvariantError(RuntimeError):
+    """Committed generation inputs violate the durable contract."""
+
+
+
+class ProviderOutcomeUnknown(RuntimeError):
+    """A dispatched provider operation cannot be safely replayed."""
+
+
+def _provider_operation(
+    db_path: str,
+    work_id: str,
+    owner: str,
+    epoch: int,
+    logical_operation_id: str,
+    scope_id: str,
+    stage_name: str,
+    operation,
+) -> dict:
+    attempt = persistence._reserve_provider_attempt(
+        db_path,
+        work_id,
+        owner,
+        epoch,
+        logical_operation_id,
+        scope_id,
+        stage_name,
+    )
+    if attempt is None:
+        raise FenceLost("provider attempt reservation rejected")
+    state = attempt["state"]
+    if state == "completed":
+        return json.loads(attempt["result_json"])
+    if state == "dispatched":
+        persistence._fail_dispatched_attempt_unknown(
+            db_path, attempt["attempt_id"], work_id, owner, epoch
+        )
+        raise ProviderOutcomeUnknown("provider_outcome_unknown")
+    if state == "failed_unknown":
+        raise ProviderOutcomeUnknown("provider_outcome_unknown")
+    if state != "reserved" or not persistence._mark_provider_attempt_dispatched(
+        db_path, attempt["attempt_id"], work_id, owner, epoch
+    ):
+        raise FenceLost("provider dispatch fence rejected")
+    try:
+        result = operation()
+    except Exception:
+        persistence._fail_dispatched_attempt_unknown(
+            db_path, attempt["attempt_id"], work_id, owner, epoch
+        )
+        raise
+    if not isinstance(result, dict):
+        result = {"result": result}
+    if not persistence._complete_provider_attempt(
+        db_path, attempt["attempt_id"], work_id, owner, epoch, result
+    ):
+        raise FenceLost("provider result fence rejected")
+    return result
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -59,113 +120,587 @@ def _tts_attempt_outcome(exc: RoutingConfigurationError) -> str:
 
 
 
-# ── Pipeline entry point (called from a background thread) ───────────────
+def _connect(db_path: str) -> sqlite3.Connection:
+    conn = persistence._get_conn(db_path)
+    persistence._ensure_schema(conn)
+    return conn
 
 
-def run_project_pipeline(db_path: str, project_id: str, output_dir: str,
-                         topic: str, bpm: int, duration_minutes: int,
-                         voice_id: str | None, outline: dict | None = None,
-                         interviewer_profile: dict | None = None,
-                         sme_profile: dict | None = None) -> None:
-    """Run the full segment generation pipeline for a project in a background thread.
+def _hydrate(db_path: str, work_id: str, owner: str, epoch: int) -> dict[str, Any]:
+    conn = _connect(db_path)
+    work = conn.execute(
+        """SELECT w.*, p.topic, p.bpm, p.duration_minutes, p.deleted_at,
+                  g.accepted_outline_json, g.interviewer_profile_json,
+                  g.sme_profile_json, g.llm_snapshot_id, g.tts_snapshot_id,
+                  g.disposition
+           FROM project_pipeline w
+           JOIN projects p ON p.project_id = w.project_id
+           JOIN project_generation g ON g.project_id = w.project_id
+           WHERE w.work_id=? AND w.lease_owner=? AND w.lease_epoch=?
+             AND w.state='leased' AND w.lease_expires_at>=?""",
+        (work_id, owner, epoch, _now_iso()),
+    ).fetchone()
+    if work is None or work["deleted_at"] is not None:
+        raise FenceLost("work lease is not current")
+    segments = conn.execute(
+        "SELECT * FROM segments WHERE project_id=? ORDER BY idx",
+        (work["project_id"],),
+    ).fetchall()
+    outline = json.loads(work["accepted_outline_json"])
+    sections = outline.get("sections", [])
+    if not segments or len(segments) != len(sections):
+        raise PipelineInvariantError("committed segment plan is inconsistent")
+    for index, (segment, section) in enumerate(zip(segments, sections)):
+        if segment["idx"] != index or section.get("index") != index:
+            raise PipelineInvariantError("committed segment order is inconsistent")
+        if segment["subtopic"] != section.get("topic"):
+            raise PipelineInvariantError("committed segment topic is inconsistent")
+    return {
+        "work": dict(work),
+        "outline": outline,
+        "segments": [persistence._row_to_segment(row) for row in segments],
+        "interviewer_profile": json.loads(work["interviewer_profile_json"]),
+        "sme_profile": json.loads(work["sme_profile_json"]),
+    }
 
-    This function is designed to be called from a daemon thread.  It handles
-    every step and persists state durably at each transition so restarts are safe.
-    """
-    try:
-        _run_pipeline(db_path, project_id, output_dir, topic, bpm, duration_minutes,
-                      voice_id, outline, interviewer_profile, sme_profile)
-    except Exception as exc:
-        # Provider exception details are not safe to expose through project manifests.
-        _persist_project_failure(db_path, project_id, _public_error_code(exc))
 
-def _run_pipeline(db_path: str, project_id: str, output_dir: str,
-                  topic: str, bpm: int, duration_minutes: int,
-                  voice_id: str | None, outline: dict | None = None,
-                  interviewer_profile: dict | None = None,
-                  sme_profile: dict | None = None) -> None:
-    out = Path(output_dir)
-
-    # 1. Transition to generating
-    _sync_status(db_path, project_id, "generating")
-
-    # 2. Generate script via LLM
-    execution = persistence._get_project_execution(db_path, project_id)
-    if execution is None:
-        raise PodcastWorkerError("missing_project_execution")
-    llm_snapshot = cfg.execution_snapshot_from_payload(execution["llm_snapshot"], execution["llm_revision"])
-    tts_snapshot = cfg.tts_snapshot_from_payload(execution["tts_snapshot"], execution["tts_revision"])
-    ledger_id = execution["ledger_id"]
-    script = generate_script(
-        topic=topic,
-        bpm=bpm,
-        duration_minutes=duration_minutes,
-        outline=outline,
-        interviewer_profile=interviewer_profile,
-        sme_profile=sme_profile,
-        snapshot=llm_snapshot,
+def _transition(
+    db_path: str,
+    work_id: str,
+    owner: str,
+    epoch: int,
+    scope_id: str,
+    stage: str,
+    state: str,
+    result: dict | None = None,
+    error_code: str | None = None,
+) -> None:
+    accepted = persistence._record_stage_transition(
+        db_path, work_id, owner, epoch, scope_id, stage, state, result, error_code
     )
-    model = "server-managed"
-    episode_title = script.get("title", topic)
+    if not accepted:
+        raise FenceLost(f"fence rejected {stage}/{scope_id}/{state}")
 
-    # 3. Create segments in the DB from outline-first generated sections
-    segments_data = script.get("segments", [])
-    total_segments = len(segments_data)
-    for i, seg_data in enumerate(segments_data):
-        seg_id = _short_id("seg")
-        segment = {
-            "segment_id": seg_id,
-            "project_id": project_id,
-            "index": i,
-            "subtopic": seg_data.get("subtopic") or seg_data.get("topic") or f"Part {i + 1}",
-            "title": seg_data.get("title") or episode_title,
-            "status": "queued",
-            "text": seg_data.get("text", ""),
-            "duration_seconds": seg_data.get("approx_duration_seconds"),
-            "primary_audio_artifact_id": None,
-            "error": None,
-            "created_at": _now_iso(),
-            "updated_at": _now_iso(),
-        }
-        _sync_upsert_segment(db_path, segment)
 
-    # 4. Process each segment through the pipeline
+def _stage_row(db_path: str, project_id: str, scope_id: str, stage: str) -> sqlite3.Row:
+    row = _connect(db_path).execute(
+        """SELECT * FROM generation_stage_results
+           WHERE project_id=? AND scope_id=? AND stage_name=?""",
+        (project_id, scope_id, stage),
+    ).fetchone()
+    if row is None:
+        raise PipelineInvariantError(f"missing {stage}/{scope_id} stage row")
+    return row
+
+
+def _completed_result(db_path: str, project_id: str, scope_id: str, stage: str) -> dict | None:
+    row = _stage_row(db_path, project_id, scope_id, stage)
+    if row["state"] == "running":
+        raise PipelineInvariantError(f"provider outcome unknown for {stage}/{scope_id}")
+    if row["state"] != "completed":
+        return None
+    return json.loads(row["result_json"]) if row["result_json"] else {}
+
+
+def _renew(db_path: str, work_id: str, owner: str, epoch: int) -> None:
+    if not persistence._renew_work_lease(
+        db_path, work_id, owner, epoch, cfg.settings.work_lease_seconds
+    ):
+        raise FenceLost("work lease renewal failed")
+
+
+def _publish_verified_text(
+    db_path: str,
+    work_id: str,
+    owner: str,
+    epoch: int,
+    segment_id: str,
+    verification: dict,
+) -> None:
+    """Atomically publish verified text/provenance and complete fact checking."""
+    conn = _connect(db_path)
+    now = _now_iso()
+    result_json = json.dumps(verification, sort_keys=True, separators=(",", ":"))
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        fence = conn.execute(
+            """SELECT w.project_id FROM project_pipeline w
+               JOIN project_generation g ON g.project_id=w.project_id
+               JOIN projects p ON p.project_id=w.project_id
+               WHERE w.work_id=? AND w.lease_owner=? AND w.lease_epoch=?
+                 AND w.state='leased' AND w.lease_expires_at>=?
+                 AND g.disposition='active' AND p.deleted_at IS NULL""",
+            (work_id, owner, epoch, now),
+        ).fetchone()
+        if fence is None:
+            raise FenceLost("verified-text publication fence rejected")
+        conn.execute(
+            """INSERT INTO provenance
+               (segment_id,prompt_id,model,source_refs,claim_notes,
+                validation_status,validation_errors,validated_at)
+               VALUES (?,?,?,?,?,'validated','[]',?)
+               ON CONFLICT(segment_id) DO UPDATE SET
+                 validation_status='validated', validation_errors='[]',
+                 validated_at=excluded.validated_at""",
+            (segment_id, f"prompt_{segment_id}", "server-profile", "[]", "[]", now),
+        )
+        conn.execute(
+            "UPDATE segments SET text=?, status='tts', updated_at=? WHERE segment_id=?",
+            (verification["verified_text"], now, segment_id),
+        )
+        conn.execute(
+            """UPDATE generation_stage_results SET state='completed', result_json=?,
+                 result_hash=?, completed_at=?, updated_at=?
+               WHERE project_id=? AND scope_id=? AND stage_name='fact_checking'""",
+            (
+                result_json,
+                hashlib.sha256(result_json.encode()).hexdigest(),
+                now,
+                now,
+                fence["project_id"],
+                segment_id,
+            ),
+        )
+        conn.execute(
+            """UPDATE project_generation SET progress_version=progress_version+1,
+                 last_transition_at=? WHERE project_id=?""",
+            (now, fence["project_id"]),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def _publish_audio(
+    db_path: str,
+    work_id: str,
+    owner: str,
+    epoch: int,
+    segment_id: str,
+    path: Path,
+    duration: float,
+) -> None:
+    artifact_id = _short_id("art")
+    now = _now_iso()
+    checksum = _sha256_file(path)
+    if not path.is_file() or not path.stat().st_size or checksum is None:
+        raise PipelineInvariantError("mixed audio failed validation")
+    conn = _connect(db_path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        fence = conn.execute(
+            """SELECT w.project_id FROM project_pipeline w
+               JOIN project_generation g ON g.project_id=w.project_id
+               JOIN projects p ON p.project_id=w.project_id
+               WHERE w.work_id=? AND w.lease_owner=? AND w.lease_epoch=?
+                 AND w.state='leased' AND w.lease_expires_at>=?
+                 AND g.disposition='active' AND p.deleted_at IS NULL""",
+            (work_id, owner, epoch, now),
+        ).fetchone()
+        if fence is None:
+            raise FenceLost("audio publication fence rejected")
+        conn.execute(
+            """INSERT INTO artifacts
+               (artifact_id,project_id,segment_id,kind,content_type,duration_seconds,
+                size_bytes,checksum_sha256,status,download_url,created_at)
+               VALUES (?,?,?,'segment_audio','audio/mpeg',?,?,?,'ready',?,?)""",
+            (artifact_id, fence["project_id"], segment_id, duration, path.stat().st_size,
+             checksum, f"/api/v1/artifacts/{artifact_id}", now),
+        )
+        conn.execute(
+            """UPDATE segments SET status='ready', primary_audio_artifact_id=?,
+                 duration_seconds=?, updated_at=? WHERE segment_id=?""",
+            (artifact_id, duration, now, segment_id),
+        )
+        result = json.dumps({"artifact_id": artifact_id, "checksum_sha256": checksum}, sort_keys=True)
+        conn.execute(
+            """UPDATE generation_stage_results SET state='completed', result_json=?,
+                 result_hash=?, completed_at=?, updated_at=?
+               WHERE project_id=? AND scope_id=? AND stage_name='mixing'""",
+            (result, hashlib.sha256(result.encode()).hexdigest(), now, now,
+             fence["project_id"], segment_id),
+        )
+        conn.execute(
+            """UPDATE project_generation SET progress_version=progress_version+1,
+                 last_transition_at=? WHERE project_id=?""",
+            (now, fence["project_id"]),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def run_project_pipeline(
+    db_path: str,
+    work_id: str,
+    lease_owner: str,
+    lease_epoch: int,
+    output_dir: str,
+) -> None:
+    """Resume one claimed work item from committed durable stage results."""
+    try:
+        _run_pipeline(db_path, work_id, lease_owner, lease_epoch, output_dir)
+    except FenceLost:
+        _settle_cancellation(db_path, work_id, lease_owner, lease_epoch)
+    except Exception as exc:
+        _settle_failure(db_path, work_id, lease_owner, lease_epoch, exc)
+
+
+def _run_pipeline(db_path: str, work_id: str, owner: str, epoch: int, output_dir: str) -> None:
+    hydrated = _hydrate(db_path, work_id, owner, epoch)
+    work = hydrated["work"]
+    project_id = work["project_id"]
+    outline = hydrated["outline"]
+    provider = cfg.settings.llm_provider
+    model = cfg.settings.openai_model if provider == "openai" else cfg.settings.openrouter_model
+    provider_args = {"provider": provider, "model": model}
+
+    research = _completed_result(db_path, project_id, "project", "research")
+    if research is None:
+        _transition(db_path, work_id, owner, epoch, "project", "research", "running")
+        research = _provider_operation(
+            db_path, work_id, owner, epoch, "lead_research", "project", "research",
+            lambda: generate_research_brief(work["topic"], outline, **provider_args),
+        )
+        _transition(db_path, work_id, owner, epoch, "project", "research", "completed", research)
+
+    out = Path(output_dir)
+    out.mkdir(parents=True, exist_ok=True)
     beat_path = out / f"beat_{project_id}.wav"
-    beat_path.parent.mkdir(parents=True, exist_ok=True)
-    beat_duration = duration_minutes * 60.0
-    save_beat_to_wav(bpm, beat_duration, str(beat_path))
+    if not beat_path.exists():
+        save_beat_to_wav(work["bpm"], work["duration_minutes"] * 60.0, str(beat_path))
 
-    segments = _sync_get_segments(db_path, project_id)
-    any_failed = False
-    ready_count = 0
+    previous_text = ""
+    for segment, section in zip(hydrated["segments"], outline["sections"]):
+        _renew(db_path, work_id, owner, epoch)
+        segment_id = segment["segment_id"]
+        section_research = _completed_result(db_path, project_id, segment_id, "research")
+        if section_research is None:
+            _transition(db_path, work_id, owner, epoch, segment_id, "research", "running")
+            section_research = _provider_operation(
+                db_path, work_id, owner, epoch,
+                f"{segment_id}:research", segment_id, "research",
+                lambda: generate_subtopic_research(
+                    work["topic"], outline, section, research, **provider_args
+                ),
+            )
+            _transition(db_path, work_id, owner, epoch, segment_id, "research", "completed", section_research)
 
-    for seg in segments:
-        try:
-            _process_segment(db_path, project_id, seg, output_dir, beat_path,
-                             bpm, duration_minutes, voice_id, model, tts_snapshot, ledger_id)
-            seg_after = _sync_get_segment(db_path, seg["segment_id"])
-            if seg_after and seg_after["status"] == "ready":
-                ready_count += 1
-        except PodcastWorkerError as exc:
-            any_failed = True
-            _persist_segment_failure(db_path, seg["segment_id"], _public_error_code(exc))
-        except Exception as exc:
-            any_failed = True
-            _persist_segment_failure(db_path, seg["segment_id"], _public_error_code(exc))
+        draft = _completed_result(db_path, project_id, segment_id, "text_generation")
+        if draft is None:
+            _transition(db_path, work_id, owner, epoch, segment_id, "text_generation", "running")
+            draft = _provider_operation(
+                db_path, work_id, owner, epoch,
+                f"{segment_id}:draft", segment_id, "text_generation",
+                lambda: generate_section_draft(
+                    work["topic"], work["bpm"], work["duration_minutes"], outline,
+                    section, research, section_research, previous_text,
+                    hydrated["interviewer_profile"], hydrated["sme_profile"],
+                    **provider_args,
+                ),
+            )
+            _transition(db_path, work_id, owner, epoch, segment_id, "text_generation", "completed", draft)
 
-    # Only a complete persisted ready manifest may create a final artifact.
-    manifest = _sync_get_segments(db_path, project_id)
-    ready_segments = [
-        item for item in manifest
-        if item["status"] == "ready" and item.get("primary_audio_artifact_id")
-    ]
-    if any_failed and not ready_segments:
-        _sync_status(db_path, project_id, "failed")
-    elif any_failed or len(ready_segments) != total_segments:
-        _sync_status(db_path, project_id, "partially_ready")
-    else:
-        _create_final_artifact(db_path, project_id, output_dir, manifest, beat_path,
-                               bpm, duration_minutes)
+        verification = _completed_result(db_path, project_id, segment_id, "fact_checking")
+        if verification is None:
+            _transition(db_path, work_id, owner, epoch, segment_id, "fact_checking", "running")
+            verification = _provider_operation(
+                db_path, work_id, owner, epoch,
+                f"{segment_id}:verify", segment_id, "fact_checking",
+                lambda: generate_verified_section(
+                    work["topic"], outline, section, research, section_research,
+                    draft["text"], **provider_args,
+                ),
+            )
+            _publish_verified_text(db_path, work_id, owner, epoch, segment_id, verification)
+        previous_text = verification["verified_text"]
+
+        if _completed_result(db_path, project_id, segment_id, "mixing") is not None:
+            continue
+        _transition(db_path, work_id, owner, epoch, segment_id, "tts", "running")
+        speech_mp3 = out / f"speech_{segment_id}.mp3"
+        speech_wav = out / f"speech_{segment_id}.wav"
+        _provider_operation(
+            db_path, work_id, owner, epoch,
+            f"{segment_id}:tts", segment_id, "tts",
+            lambda: {
+                "output": synthesize(
+                    previous_text,
+                    str(speech_mp3),
+                    provider=cfg.settings.tts_provider,
+                    voice=cfg.settings.edge_tts_voice,
+                ) or str(speech_mp3)
+            },
+        )
+        convert_to_wav(str(speech_mp3), str(speech_wav))
+        _transition(db_path, work_id, owner, epoch, segment_id, "tts", "completed",
+                    {"assembled": True})
+        _transition(db_path, work_id, owner, epoch, segment_id, "mixing", "running")
+        mixed_wav = out / f"mixed_{segment_id}.wav"
+        mixed_mp3 = out / f"mixed_{segment_id}.mp3"
+        build_podcast_audio(str(speech_wav), str(beat_path), str(mixed_wav),
+                            intro_seconds=2.0, outro_seconds=3.0, bpm=work["bpm"],
+                            duration_minutes=work["duration_minutes"])
+        convert_to_mp3(str(mixed_wav), str(mixed_mp3))
+        _publish_audio(db_path, work_id, owner, epoch, segment_id, mixed_mp3,
+                       float(segment.get("planned_duration_seconds") or 0))
+
+    _finalize(db_path, work_id, owner, epoch, project_id, hydrated["segments"], out)
+
+
+def _finalize(db_path: str, work_id: str, owner: str, epoch: int, project_id: str,
+              segments: list[dict], out: Path) -> None:
+    if _completed_result(db_path, project_id, "project", "finalizing") is not None:
+        _settle_ready(db_path, work_id, owner, epoch, None)
+        return
+    _transition(db_path, work_id, owner, epoch, "project", "finalizing", "running")
+    arrays: list[np.ndarray] = []
+    sample_rate = cfg.SAMPLE_RATE
+    for segment in segments:
+        mixed = out / f"mixed_{segment['segment_id']}.wav"
+        with wave.open(str(mixed), "rb") as stream:
+            arrays.append(np.frombuffer(stream.readframes(stream.getnframes()), dtype=np.int16))
+    final_wav = out / f"final_{project_id}.wav"
+    final_mp3 = out / f"final_{project_id}.mp3"
+    with wave.open(str(final_wav), "wb") as stream:
+        stream.setnchannels(1); stream.setsampwidth(2); stream.setframerate(sample_rate)
+        stream.writeframes(np.concatenate(arrays).tobytes())
+    convert_to_mp3(str(final_wav), str(final_mp3))
+    if not final_mp3.is_file() or not final_mp3.stat().st_size:
+        raise PipelineInvariantError("final audio failed validation")
+    _publish_final_artifact(
+        db_path,
+        work_id,
+        owner,
+        epoch,
+        project_id,
+        final_mp3,
+    )
+
+
+def _publish_final_artifact(
+    db_path: str,
+    work_id: str,
+    owner: str,
+    epoch: int,
+    project_id: str,
+    final_mp3: Path,
+) -> None:
+    """Atomically publish final audio, complete finalizing, and settle ready."""
+    artifact_id = _short_id("art")
+    checksum = _sha256_file(final_mp3)
+    if checksum is None:
+        raise PipelineInvariantError("final audio checksum failed")
+    now = _now_iso()
+    result_json = json.dumps({"artifact_id": artifact_id}, sort_keys=True)
+    conn = _connect(db_path)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        fence = conn.execute(
+            """SELECT w.project_id FROM project_pipeline w
+               JOIN project_generation g ON g.project_id=w.project_id
+               JOIN projects p ON p.project_id=w.project_id
+               WHERE w.work_id=? AND w.project_id=? AND w.lease_owner=?
+                 AND w.lease_epoch=? AND w.state='leased'
+                 AND w.lease_expires_at>=? AND g.disposition='active'
+                 AND p.deleted_at IS NULL""",
+            (work_id, project_id, owner, epoch, now),
+        ).fetchone()
+        if fence is None:
+            raise FenceLost("final publication fence rejected")
+        conn.execute(
+            """INSERT INTO artifacts
+               (artifact_id,project_id,segment_id,kind,content_type,duration_seconds,
+                size_bytes,checksum_sha256,status,download_url,created_at)
+               VALUES (?,?,NULL,'final_mp3','audio/mpeg',NULL,?,?,'ready',?,?)""",
+            (
+                artifact_id,
+                project_id,
+                final_mp3.stat().st_size,
+                checksum,
+                f"/api/v1/artifacts/{artifact_id}",
+                now,
+            ),
+        )
+        updated = conn.execute(
+            """UPDATE generation_stage_results
+               SET state='completed',result_json=?,result_hash=?,
+                   completed_at=?,updated_at=?
+               WHERE project_id=? AND scope_id='project'
+                 AND stage_name='finalizing' AND state='running'""",
+            (
+                result_json,
+                hashlib.sha256(result_json.encode()).hexdigest(),
+                now,
+                now,
+                project_id,
+            ),
+        )
+        if updated.rowcount != 1:
+            raise PipelineInvariantError("finalizing stage was not running")
+        conn.execute(
+            """UPDATE project_pipeline
+               SET state='succeeded',settled_at=?,updated_at=?
+               WHERE work_id=?""",
+            (now, now, work_id),
+        )
+        conn.execute(
+            """UPDATE project_generation
+               SET disposition='terminal',terminal_outcome='ready',terminal_at=?,
+                   last_transition_at=?,progress_version=progress_version+1
+               WHERE project_id=?""",
+            (now, now, project_id),
+        )
+        conn.execute(
+            """UPDATE projects
+               SET status='ready',final_download_ready=1,final_artifact_id=?,
+                   updated_at=? WHERE project_id=?""",
+            (artifact_id, now, project_id),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def _settle_ready(
+    db_path: str,
+    work_id: str,
+    owner: str,
+    epoch: int,
+    artifact_id: str | None,
+) -> None:
+    """Settle an already-published final artifact during idempotent recovery."""
+    conn = _connect(db_path)
+    now = _now_iso()
+    conn.execute("BEGIN IMMEDIATE")
+    row = conn.execute(
+        """SELECT w.project_id FROM project_pipeline w
+           JOIN project_generation g ON g.project_id=w.project_id
+           JOIN projects p ON p.project_id=w.project_id
+           WHERE w.work_id=? AND w.lease_owner=? AND w.lease_epoch=?
+             AND w.state='leased' AND w.lease_expires_at>=?
+             AND g.disposition='active' AND p.deleted_at IS NULL""",
+        (work_id, owner, epoch, now),
+    ).fetchone()
+    if row is None:
+        conn.rollback()
+        raise FenceLost("ready settlement fence rejected")
+    conn.execute(
+        "UPDATE project_pipeline SET state='succeeded',settled_at=?,updated_at=? WHERE work_id=?",
+        (now, now, work_id),
+    )
+    conn.execute(
+        """UPDATE project_generation
+           SET disposition='terminal',terminal_outcome='ready',terminal_at=?,
+               last_transition_at=?,progress_version=progress_version+1
+           WHERE project_id=?""",
+        (now, now, row["project_id"]),
+    )
+    conn.execute(
+        """UPDATE projects SET status='ready',final_download_ready=1,
+           final_artifact_id=COALESCE(?,final_artifact_id),updated_at=?
+           WHERE project_id=?""",
+        (artifact_id, now, row["project_id"]),
+    )
+    conn.commit()
+
+
+def _settle_cancellation(
+    db_path: str,
+    work_id: str,
+    owner: str,
+    epoch: int,
+) -> bool:
+    """Observe and atomically terminalize a requested cancellation."""
+    conn = _connect(db_path)
+    now = _now_iso()
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        row = conn.execute(
+            """SELECT w.project_id FROM project_pipeline w
+               JOIN project_generation g ON g.project_id=w.project_id
+               JOIN projects p ON p.project_id=w.project_id
+               WHERE w.work_id=? AND w.lease_owner=? AND w.lease_epoch=?
+                 AND w.state='leased' AND w.lease_expires_at>=?
+                 AND g.disposition='cancellation_requested'
+                 AND p.deleted_at IS NULL""",
+            (work_id, owner, epoch, now),
+        ).fetchone()
+        if row is None:
+            conn.rollback()
+            return False
+        project_id = row["project_id"]
+        conn.execute(
+            """UPDATE generation_stage_results
+               SET state='cancelled',cancelled_at=?,updated_at=?
+               WHERE project_id=? AND state NOT IN ('completed','failed','cancelled')""",
+            (now, now, project_id),
+        )
+        conn.execute(
+            """UPDATE segments
+               SET status='failed',error_code='cancelled',
+                   error_message='Generation was cancelled.',
+                   error_retryable=0,updated_at=?
+               WHERE project_id=? AND status!='ready'""",
+            (now, project_id),
+        )
+        conn.execute(
+            """UPDATE project_pipeline
+               SET state='cancelled',settled_at=?,updated_at=? WHERE work_id=?""",
+            (now, now, work_id),
+        )
+        conn.execute(
+            """UPDATE project_generation
+               SET disposition='terminal',terminal_outcome='cancelled',
+                   cancellation_observed_at=?,terminal_at=?,last_transition_at=?,
+                   progress_version=progress_version+1
+               WHERE project_id=?""",
+            (now, now, now, project_id),
+        )
+        conn.execute(
+            """UPDATE projects
+               SET status=CASE WHEN EXISTS(
+                   SELECT 1 FROM segments WHERE project_id=? AND status='ready'
+               ) THEN 'partially_ready' ELSE 'failed' END,updated_at=?
+               WHERE project_id=?""",
+            (project_id, now, project_id),
+        )
+        conn.commit()
+        return True
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def _settle_failure(db_path: str, work_id: str, owner: str, epoch: int, exc: Exception) -> None:
+    conn = _connect(db_path); now = _now_iso()
+    row = conn.execute("SELECT project_id FROM project_pipeline WHERE work_id=? AND lease_owner=? AND lease_epoch=? AND state='leased'",
+                       (work_id, owner, epoch)).fetchone()
+    if row is None:
+        return
+    safe_code = "provider_outcome_unknown" if "outcome unknown" in str(exc) else "pipeline_failed"
+    conn.execute("UPDATE project_pipeline SET state='failed',settled_at=?,updated_at=? WHERE work_id=? AND lease_owner=? AND lease_epoch=?",
+                 (now, now, work_id, owner, epoch))
+    conn.execute("UPDATE project_generation SET disposition='terminal',terminal_outcome='failed',terminal_at=?,last_transition_at=?,progress_version=progress_version+1 WHERE project_id=? AND disposition='active'",
+                 (now, now, row["project_id"]))
+    conn.execute("UPDATE projects SET status=CASE WHEN EXISTS(SELECT 1 FROM segments WHERE project_id=? AND status='ready') THEN 'partially_ready' ELSE 'failed' END,updated_at=? WHERE project_id=?",
+                 (row["project_id"], now, row["project_id"]))
+    conn.commit()
+    persistence._add_project_error(db_path, row["project_id"], safe_code, "Generation could not safely continue")
+
+
+def _sha256_file(path: Path) -> str | None:
+    try:
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(65536), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return None
 
 
 def _process_segment(db_path: str, project_id: str, segment: dict,
@@ -305,57 +840,6 @@ def _process_segment(db_path: str, project_id: str, segment: dict,
     _sync_update_segment_ready(db_path, seg_id, artifact_id, duration_seconds)
 
 
-def _create_final_artifact(db_path: str, project_id: str, output_dir: str,
-                           segments: list[dict], beat_path: Path, bpm: int,
-                           duration_minutes: int) -> None:
-    """Publish a final MP3 only from a complete, ordered ready-segment manifest."""
-    out = Path(output_dir)
-    final_wav = out / f"final_{project_id}.wav"
-    final_mp3 = out / f"final_{project_id}.mp3"
-    manifest = _sync_get_segments(db_path, project_id)
-    if (
-        not manifest
-        or [item["index"] for item in manifest] != list(range(len(manifest)))
-        or any(
-            item["status"] != "ready" or not item.get("primary_audio_artifact_id")
-            for item in manifest
-        )
-    ):
-        raise PodcastWorkerError("final_manifest_incomplete")
-
-    ordered_audio = []
-    for item in manifest:
-        mixed_wav = out / f"mixed_{item['segment_id']}.wav"
-        if not mixed_wav.is_file():
-            raise PodcastWorkerError("final_manifest_audio_missing")
-        ordered_audio.append(_load_wav_to_numpy(str(mixed_wav)))
-
-    _save_numpy_to_wav(np.concatenate(ordered_audio), str(final_wav))
-    duration_seconds, loudness_dbfs, true_peak = _validated_audio_metadata(final_wav)
-    convert_to_mp3(str(final_wav), str(final_mp3))
-    checksum = _sha256_file(final_mp3)
-    if checksum is None or not final_mp3.exists() or final_mp3.stat().st_size == 0:
-        raise PodcastWorkerError("final_audio_publication_failed")
-
-    final_artifact_id = _short_id("art")
-    artifact = {
-        "artifact_id": final_artifact_id,
-        "project_id": project_id,
-        "segment_id": None,
-        "kind": "final_mp3",
-        "content_type": "audio/mpeg",
-        "duration_seconds": duration_seconds,
-        "size_bytes": final_mp3.stat().st_size,
-        "checksum_sha256": checksum,
-        "status": "ready",
-        "download_url": f"/api/v1/artifacts/{final_artifact_id}",
-        "created_at": _now_iso(),
-    }
-    _sync_add_artifact(db_path, artifact)
-    _sync_status(db_path, project_id, "ready",
-                 final_download_ready=True, final_artifact_id=final_artifact_id)
-
-
 def _validated_audio_metadata(path: Path) -> tuple[float, float, float]:
     """Decode WAV media and enforce publication-safe loudness and peak bounds."""
     import wave
@@ -373,6 +857,7 @@ def _validated_audio_metadata(path: Path) -> tuple[float, float, float]:
     if peak > 0.981 or loudness_dbfs < -60.0:
         raise PodcastWorkerError("final_audio_quality_invalid")
     return frames / sample_rate, loudness_dbfs, peak
+
 
 def _persist_tts_plan(db_path: str, project_id: str, segment_id: str, plan) -> None:
     persistence._upsert_durable_record(db_path, "tts_request_plans", {
@@ -414,55 +899,6 @@ def _persist_audio_assembly(db_path: str, project_id: str, segment_id: str,
         "manifest_sha256": hashlib.sha256(repr(manifest).encode()).hexdigest(),
         "processing_revision": "assembly-v1", "state": "assembled",
     })
-
-# ── Sync helpers (callable from background thread, not async) ────────────
-
-
-def _sync_status(db_path: str, project_id: str, status: str,
-                 final_download_ready: bool = False,
-                 final_artifact_id: str | None = None) -> None:
-    import asyncio
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        # No running loop — call directly
-        persistence._update_project_status(db_path, project_id, status,
-                                           final_download_ready, final_artifact_id)
-        return
-    # We're inside an async context — use run_coroutine_threadsafe
-    import concurrent.futures
-    fut = asyncio.run_coroutine_threadsafe(
-        persistence.update_project_status(db_path, project_id, status,
-                                          final_download_ready, final_artifact_id),
-        loop,
-    )
-    fut.result(timeout=30)
-
-
-def _sync_upsert_segment(db_path: str, segment: dict) -> None:
-    persistence._upsert_segment(db_path, segment)
-
-
-def _sync_get_segments(db_path: str, project_id: str) -> list[dict]:
-    """Get segments for a project (sync, from background thread)."""
-    import sqlite3
-    conn = persistence._get_conn(db_path)
-    persistence._ensure_schema(conn)
-    rows = conn.execute(
-        "SELECT * FROM segments WHERE project_id = ? ORDER BY idx",
-        (project_id,),
-    ).fetchall()
-    return [persistence._row_to_segment(r) for r in rows]
-
-
-def _sync_get_segment(db_path: str, segment_id: str) -> dict | None:
-    import sqlite3
-    conn = persistence._get_conn(db_path)
-    persistence._ensure_schema(conn)
-    row = conn.execute(
-        "SELECT * FROM segments WHERE segment_id = ?", (segment_id,),
-    ).fetchone()
-    return persistence._row_to_segment(row) if row else None
 
 
 def _sync_update_segment_status(db_path: str, segment_id: str, status: str) -> None:
@@ -508,19 +944,3 @@ def _persist_segment_failure(db_path: str, segment_id: str, error_msg: str) -> N
         (error_msg, now, segment_id),
     )
     conn.commit()
-
-
-def _persist_project_failure(db_path: str, project_id: str, error_msg: str) -> None:
-    persistence._add_project_error(db_path, project_id, "pipeline_failed", error_msg)
-    persistence._update_project_status(db_path, project_id, "failed")
-
-
-def _sha256_file(path: Path) -> str | None:
-    try:
-        h = hashlib.sha256()
-        with open(path, "rb") as f:
-            for chunk in iter(lambda: f.read(65536), b""):
-                h.update(chunk)
-        return h.hexdigest()
-    except Exception:
-        return None

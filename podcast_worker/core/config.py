@@ -184,6 +184,9 @@ class Settings(BaseSettings):
     auth_token: str = ""
     allow_insecure_dev_auth: bool = False
     db_path: str = "podcast_worker.db"
+    work_lease_seconds: int = 300
+    work_heartbeat_seconds: int = 60
+    progress_stuck_seconds: int = 900
 
 
 def _json_object(value: str, name: str) -> dict[str, Any]:
