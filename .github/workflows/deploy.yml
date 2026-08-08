@@ -17,6 +17,9 @@ env:
   REGISTRY: ghcr.io
   IMAGE_NAME: ${{ github.repository }}
   CONTAINER_NAME: straub-ah-api
+  CADDY_CONTAINER_NAME: straub-ah-caddy
+  DOCKER_NETWORK: straub-ah
+  SERVER_NAME: straubah.duckdns.org
 
 jobs:
   deploy:
@@ -76,6 +79,16 @@ jobs:
             "${DROPLET_USER}@${DROPLET_HOST}" \
             "docker login ghcr.io --username '${{ github.actor }}' --password-stdin"
 
+      - name: Upload Caddy configuration
+        env:
+          DROPLET_HOST: ${{ secrets.DROPLET_HOST }}
+          DROPLET_USER: ${{ secrets.DROPLET_USER }}
+          DROPLET_SSH_PORT: ${{ secrets.DROPLET_SSH_PORT }}
+        run: |
+          port="${DROPLET_SSH_PORT:-22}"
+          scp -o BatchMode=yes -P "$port" ./Caddyfile \
+            "${DROPLET_USER}@${DROPLET_HOST}:/opt/straub-ah/Caddyfile"
+
       - name: Deploy and verify image
         env:
           DROPLET_HOST: ${{ secrets.DROPLET_HOST }}
@@ -85,19 +98,33 @@ jobs:
         run: |
           port="${DROPLET_SSH_PORT:-22}"
           ssh -o BatchMode=yes -p "$port" "${DROPLET_USER}@${DROPLET_HOST}" \
-            bash -s -- "$IMAGE" "$CONTAINER_NAME" <<'REMOTE_SCRIPT'
+            bash -s -- "$IMAGE" "$CONTAINER_NAME" "$CADDY_CONTAINER_NAME" "$DOCKER_NETWORK" "$SERVER_NAME" <<'REMOTE_SCRIPT'
           set -Eeuo pipefail
 
           image="$1"
           container_name="$2"
+          caddy_container_name="$3"
+          network_name="$4"
+          server_name="$5"
           env_file=/opt/straub-ah/.env
+          caddyfile=/opt/straub-ah/Caddyfile
           data_volume=straub-ah-data
+          caddy_data_volume=straub-ah-caddy-data
+          caddy_config_volume=straub-ah-caddy-config
           trap 'docker logout ghcr.io >/dev/null 2>&1 || true' EXIT
 
           if [[ ! -r "$env_file" ]]; then
             echo "Required environment file is missing or unreadable: $env_file" >&2
             exit 1
           fi
+
+          if [[ ! -r "$caddyfile" ]]; then
+            echo "Required Caddy configuration is missing or unreadable: $caddyfile" >&2
+            exit 1
+          fi
+
+          docker network inspect "$network_name" >/dev/null 2>&1 \
+            || docker network create "$network_name" >/dev/null
 
           previous_image=""
           if docker container inspect "$container_name" >/dev/null 2>&1; then
@@ -108,6 +135,8 @@ jobs:
             docker run --detach \
               --name "$container_name" \
               --restart unless-stopped \
+              --network "$network_name" \
+              --network-alias api \
               --env-file "$env_file" \
               --volume "$data_volume:/data" \
               --publish 127.0.0.1:8100:8100 \
@@ -143,8 +172,57 @@ jobs:
             exit 1
           fi
 
+          docker pull caddy:2-alpine
+          docker rm --force "$caddy_container_name" >/dev/null 2>&1 || true
+          docker run --detach \
+            --name "$caddy_container_name" \
+            --restart unless-stopped \
+            --network "$network_name" \
+            --env "SERVER_NAME=$server_name" \
+            --publish 80:80 \
+            --publish 443:443 \
+            --volume "$caddyfile:/etc/caddy/Caddyfile:ro" \
+            --volume "$caddy_data_volume:/data" \
+            --volume "$caddy_config_volume:/config" \
+            caddy:2-alpine
+
+          public_healthy=false
+          for _ in $(seq 1 30); do
+            if python3 - "$server_name" <<'PY'
+          import sys
+          import urllib.request
+
+          with urllib.request.urlopen(
+              f"https://{sys.argv[1]}/api/v1/health",
+              timeout=5,
+          ) as response:
+              if response.status != 200:
+                  raise SystemExit(f"unexpected HTTP status: {response.status}")
+          PY
+            then
+              public_healthy=true
+              break
+            fi
+
+            if [[ "$(docker container inspect --format '{{.State.Status}}' "$caddy_container_name" 2>/dev/null || true)" != running ]]; then
+              break
+            fi
+            sleep 5
+          done
+
+          if [[ "$public_healthy" != true ]]; then
+            echo "Public HTTPS health check failed: https://$server_name/api/v1/health" >&2
+            docker logs --tail 100 "$caddy_container_name" >&2 || true
+            exit 1
+          fi
+
           if [[ -n "$previous_image" && "$previous_image" != "$image" ]]; then
             docker image rm "$previous_image" >/dev/null 2>&1 || true
           fi
-          echo "Deployed $image"
+          echo "Deployed $image at https://$server_name"
           REMOTE_SCRIPT
+
+      - name: Verify public endpoint from runner
+        env:
+          PUBLIC_HEALTH_URL: https://${{ env.SERVER_NAME }}/api/v1/health
+        run: curl --fail --show-error --silent "$PUBLIC_HEALTH_URL"

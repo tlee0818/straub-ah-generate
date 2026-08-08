@@ -23,9 +23,9 @@ Non-secret LLM routes and voice defaults are committed under `podcast_worker/con
 
 ## Deploy to a DigitalOcean Droplet
 
-[`.github/workflows/deploy.yml`](.github/workflows/deploy.yml) builds the image, pushes the commit SHA and `latest` tags to GitHub Container Registry, then deploys the immutable SHA tag when `main` is updated. It can also be run manually with **Actions → Deploy to DigitalOcean → Run workflow**.
+[`.github/workflows/deploy.yml`](.github/workflows/deploy.yml) builds the API image, pushes the commit SHA and `latest` tags to GitHub Container Registry, and deploys the immutable SHA tag when `main` is updated. It also deploys Caddy from the committed [`Caddyfile`](Caddyfile), obtains and renews HTTPS certificates automatically, and verifies the public health endpoint. The workflow can also be run manually with **Actions → Deploy to DigitalOcean → Run workflow**.
 
-The Droplet must have Docker installed, and the SSH user must be able to run `docker` without an interactive `sudo` password. The workflow expects the production environment file at `/opt/straub-ah/.env`, keeps generated data in the `straub-ah-data` Docker volume, and binds the API to `127.0.0.1:8100` for a reverse proxy on the Droplet.
+The production API is available at `https://straubah.duckdns.org`. Caddy publishes ports 80 and 443 and proxies requests to the API over the private `straub-ah` Docker network. The workflow expects the production environment file at `/opt/straub-ah/.env`, keeps generated data in the `straub-ah-data` volume, and persists Caddy certificates in dedicated Docker volumes.
 
 Configure these GitHub Actions environment secrets under **Settings → Environments → production → Environment secrets**:
 

@@ -1,0 +1,9 @@
+{$SERVER_NAME} {
+	encode zstd gzip
+
+	request_body {
+		max_size 25MB
+	}
+
+	reverse_proxy api:8100
+}
