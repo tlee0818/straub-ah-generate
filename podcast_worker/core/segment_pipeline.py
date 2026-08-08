@@ -573,6 +573,7 @@ def _finalize(db_path: str, work_id: str, owner: str, epoch: int, project_id: st
         epoch,
         project_id,
         final_mp3,
+        sum(len(array) for array in arrays) / sample_rate,
     )
 
 
@@ -583,6 +584,7 @@ def _publish_final_artifact(
     epoch: int,
     project_id: str,
     final_mp3: Path,
+    duration_seconds: float,
 ) -> None:
     """Atomically publish final audio, complete finalizing, and settle ready."""
     artifact_id = _short_id("art")
@@ -610,10 +612,11 @@ def _publish_final_artifact(
             """INSERT INTO artifacts
                (artifact_id,project_id,segment_id,kind,content_type,duration_seconds,
                 size_bytes,checksum_sha256,status,download_url,created_at)
-               VALUES (?,?,NULL,'final_mp3','audio/mpeg',NULL,?,?,'ready',?,?)""",
+               VALUES (?,?,NULL,'final_mp3','audio/mpeg',?, ?,?,'ready',?,?)""",
             (
                 artifact_id,
                 project_id,
+                duration_seconds,
                 final_mp3.stat().st_size,
                 checksum,
                 f"/api/v1/artifacts/{artifact_id}",
