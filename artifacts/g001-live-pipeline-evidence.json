@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "kind": "black-box-api-test-report",
+  "surface": "api",
+  "targetHost": "straubah.duckdns.org",
+  "credentialHandling": "Authorization token supplied only through process environment; value was not logged or persisted.",
+  "scenario": "Authenticated one-minute podcast generation through production deployment",
+  "result": "passed",
+  "assertions": [
+    "Health and authenticated configuration endpoints returned successfully",
+    "Outline preview and project creation succeeded",
+    "List and detail progress versions and per-stage counters were monotonic",
+    "Research, text generation, fact checking, TTS, mixing, and finalizing each reached completed state",
+    "Validated segment text was observed before audio completion",
+    "Segment audio and final MP3 downloaded with matching checksums",
+    "Exact generated project was deleted during cleanup"
+  ],
+  "terminalProgressVersion": 14,
+  "artifacts": [
+    {"kind": "segment_audio", "byteCount": 1920356, "checksumMatches": true},
+    {"kind": "final_mp3", "byteCount": 3839416, "checksumMatches": true}
+  ],
+  "verification": {
+    "servicesTests": "151 passed",
+    "verifierFakeTests": "9 passed",
+    "liveScenario": "passed"
+  }
+}
