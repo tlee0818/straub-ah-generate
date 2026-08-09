@@ -81,6 +81,10 @@ class AppState:
         self.scripts: dict[str, dict] = {}
         self.durable_work_lock = threading.Lock()
         self.durable_work_count = 0
+        self.durable_work_threads: dict[str, threading.Thread] = {}
+        self.durable_work_stop = threading.Event()
+        self.durable_work_wake = threading.Event()
+        self.durable_work_scheduler: threading.Thread | None = None
         # Default output directory, configurable for container deployments.
         configured_output_dir = Path(cfg.settings.output_dir)
         if configured_output_dir.is_absolute():
@@ -93,10 +97,11 @@ state = AppState()
 
 
 def _run_durable_work(claim: dict) -> None:
+    work_id = claim["work_id"]
     try:
         run_project_pipeline(
             cfg.settings.db_path,
-            claim["work_id"],
+            work_id,
             claim["lease_owner"],
             claim["lease_epoch"],
             str(state.output_dir),
@@ -104,13 +109,16 @@ def _run_durable_work(claim: dict) -> None:
     finally:
         with state.durable_work_lock:
             state.durable_work_count -= 1
+            state.durable_work_threads.pop(work_id, None)
         _drain_durable_work()
 
 
 def _drain_durable_work(work_id: str | None = None) -> int:
-    """Continuously claim eligible recovery work while local capacity remains."""
+    """Claim eligible durable work until the process-wide capacity is full."""
+    if state.durable_work_stop.is_set():
+        return 0
     started = 0
-    while True:
+    while not state.durable_work_stop.is_set():
         with state.durable_work_lock:
             if state.durable_work_count >= cfg.settings.max_concurrent_generations:
                 return started
@@ -126,15 +134,44 @@ def _drain_durable_work(work_id: str | None = None) -> int:
             with state.durable_work_lock:
                 state.durable_work_count -= 1
             return started
-        threading.Thread(
+        thread = threading.Thread(
             target=_run_durable_work,
             args=(claim,),
             daemon=True,
             name=f"pipeline-{claim['work_id']}",
-        ).start()
+        )
+        with state.durable_work_lock:
+            state.durable_work_threads[claim["work_id"]] = thread
+        thread.start()
         started += 1
         if work_id is not None:
             return started
+    return started
+
+
+def _enqueue_durable_work(work_id: str) -> None:
+    """Wake the shared scheduler after a fresh durable work item is committed."""
+    state.durable_work_wake.set()
+    _drain_durable_work(work_id)
+
+
+def _join_durable_work(work_id: str | None, timeout: float = 1) -> bool:
+    if not work_id:
+        return True
+    with state.durable_work_lock:
+        thread = state.durable_work_threads.get(work_id)
+    if thread is None:
+        return True
+    thread.join(timeout=timeout)
+    return not thread.is_alive()
+
+
+def _durable_work_reclaimer() -> None:
+    interval = max(0.05, cfg.settings.work_lease_seconds / 3)
+    while not state.durable_work_stop.is_set():
+        _drain_durable_work()
+        state.durable_work_wake.wait(interval)
+        state.durable_work_wake.clear()
 
 
 def _start_one_durable_work(work_id: str | None = None) -> bool:
@@ -152,10 +189,24 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Application lifespan — startup/shutdown logic."""
     state.start_time = time.time()
     state.output_dir.mkdir(parents=True, exist_ok=True)
+    state.durable_work_stop.clear()
+    state.durable_work_wake.clear()
+    state.durable_work_scheduler = threading.Thread(
+        target=_durable_work_reclaimer,
+        daemon=True,
+        name="durable-work-reclaimer",
+    )
+    state.durable_work_scheduler.start()
     _drain_durable_work()
-    yield
-    # Cleanup on shutdown (if needed)
-
+    try:
+        yield
+    finally:
+        state.durable_work_stop.set()
+        state.durable_work_wake.set()
+        scheduler = state.durable_work_scheduler
+        if scheduler is not None:
+            scheduler.join(timeout=1)
+        state.durable_work_scheduler = None
 
 # ---------------------------------------------------------------------------
 # App

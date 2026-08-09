@@ -14,6 +14,7 @@ from __future__ import annotations
 import os
 import sqlite3
 import tempfile
+import uuid
 import threading
 from pathlib import Path
 
@@ -211,27 +212,15 @@ class TestAuth:
         assert resp.status_code == 200
 
 
-def test_pipeline_thread_receives_generation_slot(monkeypatch):
-    from podcast_worker.routers import v1_projects
+def test_pipeline_start_enqueues_shared_durable_work(monkeypatch):
+    from podcast_worker import main
 
-    captured = {}
+    captured = []
+    monkeypatch.setattr(main, "_enqueue_durable_work", captured.append)
 
-    class FakeThread:
-        def __init__(self, *, target, args, daemon):
-            captured.update(target=target, args=args, daemon=daemon)
+    real_start_project_pipeline(("db", "work", "owner", 1, "output"))
 
-        def start(self):
-            captured["started"] = True
-
-    monkeypatch.setattr(v1_projects.threading, "Thread", FakeThread)
-    pipeline_args = ("db", "work", "owner", 1, "output")
-
-    real_start_project_pipeline(pipeline_args)
-
-    assert captured["target"] is v1_projects._run_project_pipeline_with_slot
-    assert captured["args"] == (v1_projects._generation_slots, *pipeline_args)
-    assert captured["daemon"] is True
-    assert captured["started"] is True
+    assert captured == ["work"]
 
 # ── Projects CRUD ─────────────────────────────────────────────────────────
 
@@ -412,8 +401,8 @@ class TestProjectsCRUD:
             db_path, work_id, lease_owner, lease_epoch, output_dir = scheduled_args[0]
             assert db_path == v1_projects.settings.db_path
             assert work_id.startswith("work_")
-            assert lease_owner.startswith("worker_")
-            assert lease_epoch == 1
+            assert lease_owner == ""
+            assert lease_epoch == 0
             assert output_dir
 
             expected = {
@@ -690,12 +679,21 @@ class TestProjectsCRUD:
         assert resp.json()["error"]["code"] == "not_found"
 
     def test_delete_project(self, client, auth_headers):
+        from podcast_worker.core import persistence
+        from podcast_worker.core.config import settings as cfg
+
         create_resp = _reviewed_create(
             client,
             auth_headers,
             {"topic": "delete-test", "bpm": 130},
         )
         pid = create_resp.json()["project"]["project_id"]
+        persistence._add_artifact(cfg.db_path, {
+            "artifact_id": "art_delete", "project_id": pid, "segment_id": None,
+            "kind": "final_mp3", "content_type": "audio/mpeg", "status": "ready",
+            "size_bytes": 0, "checksum_sha256": "0" * 64, "object_key": "delete.mp3",
+            "download_url": "/api/v1/artifacts/art_delete",
+        })
 
         resp = client.delete(f"/api/v1/projects/{pid}", headers=auth_headers)
         assert resp.status_code == 200
@@ -703,9 +701,88 @@ class TestProjectsCRUD:
         assert data["project_id"] == pid
         assert data["status"] == "deleted"
 
-        # Subsequent GET returns 404
-        resp = client.get(f"/api/v1/projects/{pid}", headers=auth_headers)
-        assert resp.status_code == 404
+        assert client.get(f"/api/v1/projects/{pid}", headers=auth_headers).status_code == 404
+        assert client.get("/api/v1/artifacts/art_delete", headers=auth_headers).status_code == 404
+
+    def test_delete_retries_cleanup_tombstone_after_unlink_failure(
+        self, client, auth_headers, monkeypatch, tmp_path,
+    ):
+        from podcast_worker.core import persistence
+        from podcast_worker.core.config import settings as cfg
+
+        monkeypatch.setattr(cfg, "output_dir", str(tmp_path))
+        project_id = "prj_cleanup_retry"
+        output = tmp_path / "owned.mp3"
+        output.write_bytes(b"owned")
+        persistence._create_project(cfg.db_path, project_id, "single-user", "topic", 120, 5)
+        persistence._add_artifact(cfg.db_path, {
+            "artifact_id": "art_cleanup_retry", "project_id": project_id, "segment_id": None,
+            "kind": "final_mp3", "content_type": "audio/mpeg", "status": "ready",
+            "object_key": "owned.mp3", "download_url": "/api/v1/artifacts/art_cleanup_retry",
+        })
+        original_unlink = Path.unlink
+
+        def fail_owned_unlink(path, *args, **kwargs):
+            if path == output:
+                raise OSError("transient unlink failure")
+            return original_unlink(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "unlink", fail_owned_unlink)
+        assert client.delete(f"/api/v1/projects/{project_id}", headers=auth_headers).status_code == 200
+        assert output.exists()
+        assert persistence._get_cleanup_tombstone(cfg.db_path, project_id)["paths"] == ["owned.mp3"]
+
+        monkeypatch.setattr(Path, "unlink", original_unlink)
+        assert client.delete(f"/api/v1/projects/{project_id}", headers=auth_headers).status_code == 200
+        assert not output.exists()
+        assert persistence._get_cleanup_tombstone(cfg.db_path, project_id) is None
+
+    def test_delete_defers_final_sweep_until_active_writer_exits(
+        self, client, auth_headers, monkeypatch, tmp_path,
+    ):
+        from podcast_worker.core import persistence
+        from podcast_worker.core.config import settings as cfg
+        from podcast_worker.routers import v1_projects
+
+        monkeypatch.setattr(cfg, "output_dir", str(tmp_path))
+        project_id = "prj_active_writer"
+        work_id = f"work_{uuid.uuid5(uuid.NAMESPACE_URL, f'{project_id}:pipeline').hex}"
+        persistence._create_project(cfg.db_path, project_id, "single-user", "topic", 120, 5)
+        now = persistence._now_iso()
+        connection = persistence._get_conn(cfg.db_path)
+        connection.execute(
+            """INSERT INTO project_pipeline
+               (work_id, project_id, state, created_at, updated_at)
+               VALUES (?, ?, 'leased', ?, ?)""",
+            (work_id, project_id, now, now),
+        )
+        connection.commit()
+        persistence._add_artifact(cfg.db_path, {
+            "artifact_id": "art_active_writer", "project_id": project_id, "segment_id": None,
+            "kind": "final_mp3", "content_type": "audio/mpeg", "status": "ready",
+            "object_key": "writer.mp3", "download_url": "/api/v1/artifacts/art_active_writer",
+        })
+        release = threading.Event()
+
+        def active_writer():
+            release.wait()
+            (tmp_path / "writer.mp3").write_bytes(b"late")
+
+        worker = threading.Thread(target=active_writer)
+        worker.start()
+        from podcast_worker import main
+        with main.state.durable_work_lock:
+            main.state.durable_work_threads[work_id] = worker
+
+        assert client.delete(f"/api/v1/projects/{project_id}", headers=auth_headers).status_code == 200
+        assert persistence._get_cleanup_tombstone(cfg.db_path, project_id) is not None
+        release.set()
+        worker.join()
+        assert client.delete(f"/api/v1/projects/{project_id}", headers=auth_headers).status_code == 200
+        assert not (tmp_path / "writer.mp3").exists()
+        with main.state.durable_work_lock:
+            main.state.durable_work_threads.pop(work_id, None)
+        assert persistence._get_cleanup_tombstone(cfg.db_path, project_id) is None
 
     def test_delete_nonexistent_project(self, client, auth_headers):
         resp = client.delete("/api/v1/projects/prj_fake", headers=auth_headers)

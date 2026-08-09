@@ -363,6 +363,14 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
 
         CREATE INDEX IF NOT EXISTS idx_preview_binding_expiry
             ON outline_preview_bindings(owner_id, expires_at, consumed_at);
+        CREATE TABLE IF NOT EXISTS project_cleanup_tombstones (
+            project_id TEXT PRIMARY KEY,
+            work_id TEXT,
+            paths_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            last_attempt_at TEXT,
+            attempts INTEGER NOT NULL DEFAULT 0
+        );
     """)
     # Existing installations may predate durable routing columns.  Keep this
     # additive migration serialized with all other writers.
@@ -391,7 +399,12 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     artifact_columns = {row["name"] for row in conn.execute("PRAGMA table_info(artifacts)")}
     if "object_key" not in artifact_columns:
         conn.execute("ALTER TABLE artifacts ADD COLUMN object_key TEXT")
-    conn.execute("PRAGMA user_version = 4")
+    tombstone_columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(project_cleanup_tombstones)")
+    }
+    if "work_id" not in tombstone_columns:
+        conn.execute("ALTER TABLE project_cleanup_tombstones ADD COLUMN work_id TEXT")
+    conn.execute("PRAGMA user_version = 5")
     conn.commit()
 
 
@@ -1115,7 +1128,8 @@ def _fail_dispatched_attempt_unknown(
                JOIN projects p ON p.project_id=w.project_id
                WHERE a.attempt_id=? AND a.work_id=? AND a.state='dispatched'
                  AND w.lease_owner=? AND w.lease_epoch=? AND w.state='leased'
-                 AND w.lease_expires_at>=? AND p.deleted_at IS NULL""",
+                 AND (w.lease_expires_at>=? OR g.disposition='cancellation_requested')
+                 AND p.deleted_at IS NULL""",
             (attempt_id, work_id, lease_owner, lease_epoch, now),
         ).fetchone()
         if attempt is None:
@@ -1130,6 +1144,12 @@ def _fail_dispatched_attempt_unknown(
                 """UPDATE generation_stage_results SET state='cancelled',cancelled_at=?,updated_at=?
                    WHERE project_id=? AND state NOT IN ('completed','failed','cancelled')""",
                 (now, now, attempt["project_id"]),
+            )
+            conn.execute(
+                """UPDATE segments SET status='failed',error_code='cancelled',
+                   error_message='Generation was cancelled.',error_retryable=0,updated_at=?
+                   WHERE project_id=? AND status!='ready'""",
+                (now, attempt["project_id"]),
             )
             conn.execute(
                 "UPDATE project_pipeline SET state='cancelled',settled_at=?,updated_at=? WHERE work_id=?",
@@ -1254,11 +1274,17 @@ def _request_project_cancellation(
         raise
 
 
-def _delete_project(db_path: str, project_id: str) -> dict | None:
-    """Fence publication and retire project-owned metadata atomically."""
+def _delete_project(
+    db_path: str, project_id: str, cleanup_paths: list[str] | None = None,
+) -> dict | None:
+    """Fence work, persist cleanup intent, then retire project metadata atomically."""
     conn = _get_conn(db_path)
     _ensure_schema(conn)
     now = _now_iso()
+    canonical_paths = sorted({
+        Path(path).as_posix() for path in (cleanup_paths or [])
+        if path and not Path(path).is_absolute() and ".." not in Path(path).parts
+    })
     conn.execute("BEGIN IMMEDIATE")
     try:
         row = conn.execute(
@@ -1267,8 +1293,27 @@ def _delete_project(db_path: str, project_id: str) -> dict | None:
         if row is None:
             result = None
         elif row["deleted_at"] is not None:
-            result = {"project_id": project_id, "status": "deleted", "deleted_at": row["deleted_at"]}
+            pipeline = conn.execute(
+                "SELECT work_id FROM project_pipeline WHERE project_id = ?", (project_id,)
+            ).fetchone()
+            result = {
+                "project_id": project_id, "status": "deleted", "deleted_at": row["deleted_at"],
+                "work_id": pipeline["work_id"] if pipeline else None,
+            }
         else:
+            pipeline = conn.execute(
+                "SELECT work_id FROM project_pipeline WHERE project_id = ?", (project_id,)
+            ).fetchone()
+            conn.execute(
+                """INSERT INTO project_cleanup_tombstones
+                   (project_id, work_id, paths_json, created_at)
+                   VALUES (?, ?, ?, ?)
+                   ON CONFLICT(project_id) DO NOTHING""",
+                (
+                    project_id, pipeline["work_id"] if pipeline else None,
+                    json.dumps(canonical_paths), now,
+                ),
+            )
             conn.execute(
                 """UPDATE projects
                    SET status = 'deleted', deleted_at = ?, final_download_ready = 0,
@@ -1276,6 +1321,26 @@ def _delete_project(db_path: str, project_id: str) -> dict | None:
                    WHERE project_id = ? AND deleted_at IS NULL""",
                 (now, now, project_id),
             )
+            conn.execute(
+                """UPDATE project_generation
+                   SET disposition='terminal', terminal_outcome='deleted',
+                       terminal_at=?, last_transition_at=?,
+                       progress_version=progress_version+1
+                   WHERE project_id=? AND disposition IN ('active', 'cancellation_requested')""",
+                (now, now, project_id),
+            )
+            conn.execute(
+                """UPDATE project_pipeline
+                   SET state='cancelled', lease_expires_at=?, settled_at=?, updated_at=?
+                   WHERE project_id=? AND state IN ('pending', 'leased')""",
+                (now, now, now, project_id),
+            )
+            conn.execute("DELETE FROM provider_attempts WHERE project_id = ?", (project_id,))
+            conn.execute("DELETE FROM project_pipeline WHERE project_id = ?", (project_id,))
+            conn.execute("DELETE FROM generation_stage_results WHERE project_id = ?", (project_id,))
+            conn.execute("DELETE FROM project_generation WHERE project_id = ?", (project_id,))
+            conn.execute("DELETE FROM work_items WHERE project_id = ?", (project_id,))
+            conn.execute("DELETE FROM project_errors WHERE project_id = ?", (project_id,))
             conn.execute(
                 """DELETE FROM execution_attempts
                    WHERE plan_id IN (
@@ -1287,12 +1352,68 @@ def _delete_project(db_path: str, project_id: str) -> dict | None:
             conn.execute("DELETE FROM audio_assemblies WHERE project_id = ?", (project_id,))
             conn.execute("DELETE FROM artifacts WHERE project_id = ?", (project_id,))
             conn.execute("DELETE FROM segments WHERE project_id = ?", (project_id,))
-            result = {"project_id": project_id, "status": "deleted", "deleted_at": now}
+            result = {
+                "project_id": project_id, "status": "deleted", "deleted_at": now,
+                "work_id": pipeline["work_id"] if pipeline else None,
+            }
     except Exception:
         conn.rollback()
         raise
     conn.commit()
     return result
+
+
+def _get_cleanup_tombstone(db_path: str, project_id: str) -> dict | None:
+    conn = _get_conn(db_path)
+    _ensure_schema(conn)
+    row = conn.execute(
+        "SELECT work_id, paths_json FROM project_cleanup_tombstones WHERE project_id=?", (project_id,)
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "project_id": project_id, "work_id": row["work_id"],
+        "paths": json.loads(row["paths_json"]),
+    }
+def _extend_cleanup_tombstone(
+    db_path: str, project_id: str, cleanup_paths: list[str],
+) -> None:
+    conn = _get_conn(db_path)
+    _ensure_schema(conn)
+    row = conn.execute(
+        "SELECT paths_json FROM project_cleanup_tombstones WHERE project_id=?", (project_id,)
+    ).fetchone()
+    if row is None:
+        return
+    paths = set(json.loads(row["paths_json"]))
+    paths.update(
+        Path(path).as_posix() for path in cleanup_paths
+        if path and not Path(path).is_absolute() and ".." not in Path(path).parts
+    )
+    conn.execute(
+        "UPDATE project_cleanup_tombstones SET paths_json=? WHERE project_id=?",
+        (json.dumps(sorted(paths)), project_id),
+    )
+    conn.commit()
+
+
+
+
+def _record_cleanup_tombstone_result(
+    db_path: str, project_id: str, remaining_paths: list[str],
+) -> None:
+    conn = _get_conn(db_path)
+    _ensure_schema(conn)
+    now = _now_iso()
+    if remaining_paths:
+        conn.execute(
+            """UPDATE project_cleanup_tombstones
+               SET paths_json=?, last_attempt_at=?, attempts=attempts+1 WHERE project_id=?""",
+            (json.dumps(sorted(set(remaining_paths))), now, project_id),
+        )
+    else:
+        conn.execute("DELETE FROM project_cleanup_tombstones WHERE project_id=?", (project_id,))
+    conn.commit()
 
 
 def _get_deleted_project_by_id(db_path: str, project_id: str) -> dict | None:
@@ -1889,8 +2010,29 @@ async def get_deleted_project(db_path: str, project_id: str) -> dict | None:
 
 
 
-async def delete_project(db_path: str, project_id: str) -> dict | None:
-    return await _run_in_executor(_delete_project, db_path, project_id)
+async def delete_project(
+    db_path: str, project_id: str, cleanup_paths: list[str] | None = None,
+) -> dict | None:
+    return await _run_in_executor(_delete_project, db_path, project_id, cleanup_paths)
+async def get_cleanup_tombstone(db_path: str, project_id: str) -> dict | None:
+    return await _run_in_executor(_get_cleanup_tombstone, db_path, project_id)
+async def extend_cleanup_tombstone(
+    db_path: str, project_id: str, cleanup_paths: list[str],
+) -> None:
+    return await _run_in_executor(
+        _extend_cleanup_tombstone, db_path, project_id, cleanup_paths
+    )
+
+
+
+async def record_cleanup_tombstone_result(
+    db_path: str, project_id: str, remaining_paths: list[str],
+) -> None:
+    return await _run_in_executor(
+        _record_cleanup_tombstone_result, db_path, project_id, remaining_paths
+    )
+
+
 
 
 async def request_project_cancellation(

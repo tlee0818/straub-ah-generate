@@ -141,6 +141,13 @@ def test_ambiguous_provider_attempt_prefers_requested_cancellation(tmp_path):
     assert persistence._request_project_cancellation(
         db_path, "prj_provider", "single-user"
     ) is not None
+    connection = sqlite3.connect(db_path)
+    connection.execute(
+        "UPDATE project_pipeline SET lease_expires_at='2000-01-01T00:00:00+00:00' WHERE work_id=?",
+        (claim["work_id"],),
+    )
+    connection.commit()
+    connection.close()
 
     assert persistence._fail_dispatched_attempt_unknown(
         db_path,

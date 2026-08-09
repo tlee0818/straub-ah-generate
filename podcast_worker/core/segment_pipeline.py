@@ -161,6 +161,10 @@ def _canonical_verified_dialogue(verification: dict, draft_text: str) -> dict:
         parse_dialogue_turns(draft_text)
         return {**verification, "verified_text": draft_text}
 def _synthesize_snapshot(
+    db_path: str | None,
+    project_id: str | None,
+    segment_id: str | None,
+    ledger_id: str | None,
     text: str,
     snapshot: cfg.ResolvedTTSSnapshot,
     output_path: Path,
@@ -173,30 +177,18 @@ def _synthesize_snapshot(
             output_path=str(output_path),
             voice=snapshot.voice_bindings["interviewer"],
         )
-    from pydub import AudioSegment
-
-    plans = plan_dialogue_requests(text, snapshot, namespace=namespace)
-    if not plans:
-        raise RoutingConfigurationError("tts_empty_plan")
-    rendered_paths: list[str] = []
-    for index, plan in enumerate(plans):
-        rendered_path = str(output_path.with_name(f"{output_path.stem}-{index}.mp3"))
-        if snapshot.provider == "elevenlabs":
-            rendered_paths.append(synthesize_elevenlabs_plan(plan, snapshot, rendered_path))
-        else:
-            rendered_paths.append(
-                synthesize(
-                    plan.turns[0].text,
-                    provider=snapshot.provider,
-                    output_path=rendered_path,
-                    voice=plan.voice_binding,
-                )
-            )
-    combined = AudioSegment.empty()
-    for rendered_path in rendered_paths:
-        combined += AudioSegment.from_file(rendered_path)
-    combined.export(output_path, format="mp3")
-    return str(output_path)
+    if not all((db_path, project_id, segment_id, ledger_id)):
+        raise PipelineInvariantError("durable TTS execution requires project context")
+    return _execute_tts_plans(
+        db_path,
+        project_id,
+        segment_id,
+        ledger_id,
+        text,
+        snapshot,
+        output_path,
+        namespace,
+    )
 
 
 
@@ -283,6 +275,7 @@ def _hydrate(db_path: str, work_id: str, owner: str, epoch: int) -> dict[str, An
         "sme_profile": json.loads(work["sme_profile_json"]),
         "llm_snapshot": llm_snapshot,
         "tts_snapshot": tts_snapshot,
+        "ledger_id": execution["ledger_id"],
     }
 
 
@@ -349,13 +342,18 @@ def _renew(db_path: str, work_id: str, owner: str, epoch: int) -> None:
             operation="lease_renew",
         )
         raise FenceLost("work lease renewal failed")
+    _observe_pipeline_health(db_path)
+
 def _with_lease_renewal(
     db_path: str, work_id: str, owner: str, epoch: int, operation
 ):
     """Renew a fenced lease while a blocking provider or audio operation runs."""
     lost = threading.Event()
     done = threading.Event()
-    interval = max(0.05, cfg.settings.work_lease_seconds / 3)
+    interval = max(0.05, min(
+        cfg.settings.work_heartbeat_seconds,
+        cfg.settings.work_lease_seconds / 3,
+    ))
 
     def heartbeat() -> None:
         while not done.wait(interval):
@@ -367,6 +365,8 @@ def _with_lease_renewal(
                 operation="renew",
                 outcome="renewed" if renewed else "rejected",
             )
+            if renewed:
+                _observe_pipeline_health(db_path)
             if not renewed:
                 metrics.increment(
                     "podcast_fence_rejections_total",
@@ -581,6 +581,7 @@ def _run_pipeline(db_path: str, work_id: str, owner: str, epoch: int, output_dir
     outline = hydrated["outline"]
     llm_snapshot = hydrated["llm_snapshot"]
     tts_snapshot = hydrated["tts_snapshot"]
+    ledger_id = hydrated["ledger_id"]
     provider_args = {"snapshot": llm_snapshot}
 
     research = _completed_result(db_path, project_id, "project", "research")
@@ -666,6 +667,10 @@ def _run_pipeline(db_path: str, work_id: str, owner: str, epoch: int, output_dir
             f"{segment_id}:tts", segment_id, "tts",
             lambda: {
                 "output": _synthesize_snapshot(
+                    db_path,
+                    project_id,
+                    segment_id,
+                    ledger_id,
                     previous_text,
                     tts_snapshot,
                     speech_mp3,
@@ -879,10 +884,10 @@ def _settle_cancellation(
                JOIN project_generation g ON g.project_id=w.project_id
                JOIN projects p ON p.project_id=w.project_id
                WHERE w.work_id=? AND w.lease_owner=? AND w.lease_epoch=?
-                 AND w.state='leased' AND w.lease_expires_at>=?
+                 AND w.state='leased'
                  AND g.disposition='cancellation_requested'
                  AND p.deleted_at IS NULL""",
-            (work_id, owner, epoch, now),
+            (work_id, owner, epoch),
         ).fetchone()
         if row is None:
             conn.rollback()
@@ -958,141 +963,108 @@ def _sha256_file(path: Path) -> str | None:
         return None
 
 
-def _process_segment(db_path: str, project_id: str, segment: dict,
-                     output_dir: str, beat_path: Path, bpm: int,
-                     duration_minutes: int, voice_id: str | None,
-                     script_model: str, tts_snapshot: cfg.ResolvedTTSSnapshot,
-                     ledger_id: str) -> None:
-    seg_id = segment["segment_id"]
-    text = segment.get("text") or ""
-    subtopic = segment.get("subtopic", "")
+def _execute_tts_plans(
+    db_path: str,
+    project_id: str,
+    segment_id: str,
+    ledger_id: str,
+    text: str,
+    snapshot: cfg.ResolvedTTSSnapshot,
+    output_path: Path,
+    namespace: str,
+) -> str:
+    """Durably render bounded dialogue plans and assemble them in plan order."""
+    from pydub import AudioSegment
 
-    # ── scripting (already done during script generation) ──
-    _sync_update_segment_status(db_path, seg_id, "scripting")
+    plans = plan_dialogue_requests(text, snapshot, namespace=namespace)
+    if not plans:
+        raise RoutingConfigurationError("tts_empty_plan")
+    for plan in plans:
+        _persist_tts_plan(db_path, project_id, segment_id, plan)
 
-    # ── validating ──
-    _sync_update_segment_status(db_path, seg_id, "validating")
-    provenance = {
-        "prompt_id": f"prompt_{seg_id}",
-        "model": script_model,
-        "source_refs": [],
-        "claim_notes": [f"Generated from topic: {subtopic}"],
-        "validation_status": "validated",
-        "validation_errors": [],
-        "validated_at": _now_iso(),
-    }
-    _sync_upsert_provenance(db_path, seg_id, provenance)
-
-    # ── tts ──
-    _sync_update_segment_status(db_path, seg_id, "tts")
-    speech_path = Path(output_dir) / f"speech_{seg_id}.mp3"
-    speech_path.parent.mkdir(parents=True, exist_ok=True)
-    if tts_snapshot.provider == "elevenlabs":
-        from podcast_worker.core.tts_engine import plan_dialogue_requests, synthesize_elevenlabs_plan
-        from pydub import AudioSegment
-
-        plans = plan_dialogue_requests(text, tts_snapshot, namespace=f"{project_id}:{seg_id}")
-        rendered_by_plan: dict[str, str] = {}
-
-        for plan in plans:
-            _persist_tts_plan(db_path, project_id, seg_id, plan)
-
-        def render(plan):
-            characters = len("".join(turn.text for turn in plan.turns))
-            for attempt_number in range(max(1, tts_snapshot.max_attempts)):
-                attempt_id = _short_id("att")
-                _append_tts_ledger_entry(db_path, ledger_id, plan.plan_id, attempt_id, "reserved", characters)
-                _persist_tts_attempt(db_path, ledger_id, plan, attempt_id, tts_snapshot, "pre_send")
-                _persist_tts_attempt(db_path, ledger_id, plan, attempt_id, tts_snapshot, "dispatched")
-                try:
-                    rendered_path = synthesize_elevenlabs_plan(
-                        plan, tts_snapshot, str(speech_path.with_name(f"{speech_path.stem}-{plan.plan_id}.mp3"))
-                    )
-                except RoutingConfigurationError as exc:
-                    outcome = _tts_attempt_outcome(exc)
-                    _persist_tts_attempt(
-                        db_path, ledger_id, plan, attempt_id, tts_snapshot, outcome,
-                        {"code": outcome},
-                    )
-                    _append_tts_ledger_entry(db_path, ledger_id, plan.plan_id, attempt_id, "released", characters)
-                    if outcome == "retryable" and attempt_number + 1 < max(1, tts_snapshot.max_attempts):
-                        continue
-                    raise
-                except Exception:
-                    _persist_tts_attempt(
-                        db_path, ledger_id, plan, attempt_id, tts_snapshot, "unknown_outcome",
-                        {"code": "unknown_outcome"},
-                    )
-                    _append_tts_ledger_entry(db_path, ledger_id, plan.plan_id, attempt_id, "released", characters)
-                    raise RoutingConfigurationError("tts_outcome_unknown")
-                _persist_tts_attempt(db_path, ledger_id, plan, attempt_id, tts_snapshot, "published")
-                _append_tts_ledger_entry(db_path, ledger_id, plan.plan_id, attempt_id, "actual", characters)
-                _append_tts_ledger_entry(db_path, ledger_id, plan.plan_id, attempt_id, "released", characters)
-                return plan.plan_id, rendered_path
-            raise RoutingConfigurationError("tts_outcome_unknown")
-
-        worker_count = min(len(plans), max(1, tts_snapshot.max_concurrent_requests))
-        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix=f"tts-{seg_id}") as executor:
-            futures = {executor.submit(render, plan): plan.plan_id for plan in plans}
+    def render(plan) -> tuple[str, str]:
+        characters = len("".join(turn.text for turn in plan.turns))
+        for attempt_number in range(max(1, snapshot.max_attempts)):
+            attempt_id = _short_id("att")
+            _append_tts_ledger_entry(
+                db_path, ledger_id, plan.plan_id, attempt_id, "reserved", characters
+            )
+            _persist_tts_attempt(
+                db_path, ledger_id, plan, attempt_id, snapshot, "pre_send"
+            )
+            _persist_tts_attempt(
+                db_path, ledger_id, plan, attempt_id, snapshot, "dispatched"
+            )
             try:
-                for future in as_completed(futures):
-                    plan_id, rendered_path = future.result()
-                    rendered_by_plan[plan_id] = rendered_path
-            except Exception:
-                for future in futures:
-                    future.cancel()
+                rendered_path = str(
+                    output_path.with_name(f"{output_path.stem}-{plan.plan_id}.mp3")
+                )
+                if snapshot.provider == "elevenlabs":
+                    rendered_path = synthesize_elevenlabs_plan(
+                        plan, snapshot, rendered_path
+                    )
+                else:
+                    rendered_path = synthesize(
+                        "".join(turn.text for turn in plan.turns),
+                        provider=snapshot.provider,
+                        output_path=rendered_path,
+                        voice=plan.voice_binding,
+                    )
+            except RoutingConfigurationError as exc:
+                outcome = _tts_attempt_outcome(exc)
+                _persist_tts_attempt(
+                    db_path, ledger_id, plan, attempt_id, snapshot, outcome,
+                    {"code": outcome},
+                )
+                _append_tts_ledger_entry(
+                    db_path, ledger_id, plan.plan_id, attempt_id, "released", characters
+                )
+                if outcome == "retryable" and attempt_number + 1 < max(1, snapshot.max_attempts):
+                    continue
                 raise
+            except Exception:
+                _persist_tts_attempt(
+                    db_path, ledger_id, plan, attempt_id, snapshot, "unknown_outcome",
+                    {"code": "unknown_outcome"},
+                )
+                _append_tts_ledger_entry(
+                    db_path, ledger_id, plan.plan_id, attempt_id, "released", characters
+                )
+                raise RoutingConfigurationError("tts_outcome_unknown")
+            _persist_tts_attempt(
+                db_path, ledger_id, plan, attempt_id, snapshot, "published"
+            )
+            _append_tts_ledger_entry(
+                db_path, ledger_id, plan.plan_id, attempt_id, "actual", characters
+            )
+            _append_tts_ledger_entry(
+                db_path, ledger_id, plan.plan_id, attempt_id, "released", characters
+            )
+            return plan.plan_id, rendered_path
+        raise RoutingConfigurationError("tts_outcome_unknown")
 
-        rendered = [rendered_by_plan[plan.plan_id] for plan in plans]
-        combined = AudioSegment.empty()
-        for rendered_path in rendered:
-            combined += AudioSegment.from_file(rendered_path)
-        combined.export(speech_path, format="mp3")
-        _persist_audio_assembly(db_path, project_id, seg_id, rendered)
-    else:
-        synthesize(
-            text,
-            provider=tts_snapshot.provider,
-            output_path=str(speech_path),
-            voice=tts_snapshot.voice_bindings["interviewer"],
-        )
+    worker_count = min(len(plans), max(1, snapshot.max_concurrent_requests))
+    rendered_by_plan: dict[str, str] = {}
+    with ThreadPoolExecutor(
+        max_workers=worker_count, thread_name_prefix=f"tts-{segment_id}"
+    ) as executor:
+        futures = {executor.submit(render, plan): plan.plan_id for plan in plans}
+        try:
+            for future in as_completed(futures):
+                plan_id, rendered_path = future.result()
+                rendered_by_plan[plan_id] = rendered_path
+        except Exception:
+            for future in futures:
+                future.cancel()
+            raise
 
-    # Convert to WAV for mixing
-    speech_wav = Path(output_dir) / f"speech_{seg_id}.wav"
-    convert_to_wav(str(speech_path), str(speech_wav))
-
-    # ── mixing ──
-    _sync_update_segment_status(db_path, seg_id, "mixing")
-    mixed_wav = Path(output_dir) / f"mixed_{seg_id}.wav"
-    build_podcast_audio(
-        str(speech_wav), str(beat_path), str(mixed_wav),
-        intro_seconds=2.0, outro_seconds=3.0, bpm=bpm,
-        duration_minutes=duration_minutes,
-    )
-    mixed_mp3 = Path(output_dir) / f"mixed_{seg_id}.mp3"
-    # ── ready ──
-    duration_seconds, loudness_dbfs, true_peak = _validated_audio_metadata(mixed_wav)
-    convert_to_mp3(str(mixed_wav), str(mixed_mp3))
-    checksum = _sha256_file(mixed_mp3)
-    if checksum is None or not mixed_mp3.exists() or mixed_mp3.stat().st_size == 0:
-        raise PodcastWorkerError("segment_audio_publication_failed")
-
-    artifact_id = _short_id("art")
-    artifact = {
-        "artifact_id": artifact_id,
-        "project_id": project_id,
-        "segment_id": seg_id,
-        "kind": "segment_audio",
-        "content_type": "audio/mpeg",
-        "duration_seconds": duration_seconds,
-        "size_bytes": mixed_mp3.stat().st_size,
-        "checksum_sha256": checksum,
-        "status": "ready",
-        "download_url": f"/api/v1/artifacts/{artifact_id}",
-        "created_at": _now_iso(),
-    }
-    _sync_add_artifact(db_path, artifact)
-    _sync_update_segment_ready(db_path, seg_id, artifact_id, duration_seconds)
+    rendered = [rendered_by_plan[plan.plan_id] for plan in plans]
+    combined = AudioSegment.empty()
+    for rendered_path in rendered:
+        combined += AudioSegment.from_file(rendered_path)
+    combined.export(output_path, format="mp3")
+    _persist_audio_assembly(db_path, project_id, segment_id, rendered)
+    return str(output_path)
 
 
 def _validated_audio_metadata(path: Path) -> tuple[float, float, float]:

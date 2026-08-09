@@ -44,10 +44,9 @@ from podcast_worker.core.models_v1 import (
     ProjectListResponse,
     ProjectSummary,
 )
-from podcast_worker.core.segment_pipeline import run_project_pipeline
 
 router = APIRouter(prefix="/api/v1/projects", tags=["v1-projects"])
-_generation_slots = threading.BoundedSemaphore(settings.max_concurrent_generations)
+_generation_slots = threading.Semaphore(settings.max_concurrent_generations)
 
 
 def _db_path() -> str:
@@ -86,13 +85,57 @@ def _project_cleanup_paths(project: dict, output_dir: Path) -> list[Path]:
     return paths
 
 
-def _remove_project_files(project: dict) -> None:
-    for path in _project_cleanup_paths(project, Path(_output_dir())):
+def _cleanup_path_keys(project: dict) -> list[str]:
+    root = Path(_output_dir()).resolve()
+    return [
+        path.relative_to(root).as_posix()
+        for path in _project_cleanup_paths(project, root)
+    ]
+
+
+async def _sweep_project_cleanup(
+    project_id: str, cleanup_paths: list[str] | None = None,
+) -> None:
+    if cleanup_paths:
+        await persistence.extend_cleanup_tombstone(
+            _db_path(), project_id, cleanup_paths
+        )
+    tombstone = await persistence.get_cleanup_tombstone(_db_path(), project_id)
+    if tombstone is None:
+        return
+    if not _join_project_work(tombstone.get("work_id")):
+        return
+    root = Path(_output_dir()).resolve()
+    remaining = []
+    for key in tombstone["paths"]:
+        candidate = _safe_cleanup_path(root, key)
+        if candidate is None:
+            remaining.append(key)
+            continue
         try:
-            path.unlink()
+            candidate.unlink()
         except FileNotFoundError:
             pass
+        except OSError:
+            remaining.append(key)
+    await persistence.record_cleanup_tombstone_result(
+        _db_path(), project_id, remaining
+    )
 
+
+def _safe_cleanup_path(root: Path, key: str) -> Path | None:
+    candidate = (root / key).resolve()
+    try:
+        candidate.relative_to(root)
+    except ValueError:
+        return None
+    return candidate
+
+
+def _join_project_work(work_id: str | None) -> bool:
+    from podcast_worker.main import _join_durable_work
+
+    return _join_durable_work(work_id)
 
 
 
@@ -138,20 +181,13 @@ def _short_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:12]}"
 
 
-def _run_project_pipeline_with_slot(slot, *args) -> None:
-    try:
-        run_project_pipeline(*args)
-    finally:
-        slot.release()
 
 
 def _start_project_pipeline(args: tuple) -> None:
-    thread = threading.Thread(
-        target=_run_project_pipeline_with_slot,
-        args=(_generation_slots, *args),
-        daemon=True,
-    )
-    thread.start()
+    """Compatibility entrypoint that delegates all work to the shared scheduler."""
+    from podcast_worker.main import _enqueue_durable_work
+
+    _enqueue_durable_work(args[1])
 
 
 def _project_not_found(project_id: str) -> HTTPException:
@@ -333,8 +369,6 @@ async def create_project(
                 )
             ).model_dump(),
         )
-    if not _generation_slots.acquire(blocking=False):
-        raise HTTPException(status_code=503, detail="Generation capacity is full.")
     try:
         project = await persistence.create_progress_project(
             db,
@@ -351,7 +385,6 @@ async def create_project(
             outline_preview_id,
         )
     except ValueError as exc:
-        _generation_slots.release()
         code = str(exc)
         if code.startswith("preview_binding_"):
             raise HTTPException(
@@ -361,33 +394,9 @@ async def create_project(
                 ).model_dump(),
             ) from exc
         raise HTTPException(status_code=422, detail=str(exc)) from exc
-    except Exception:
-        _generation_slots.release()
-        raise
 
     work_id = f"work_{uuid.uuid5(uuid.NAMESPACE_URL, f'{project_id}:pipeline').hex}"
-    lease_owner = _short_id("worker")
-    try:
-        claim = await persistence.claim_next_work(
-            db,
-            lease_owner,
-            settings.work_lease_seconds,
-            work_id,
-        )
-        if claim is None:
-            raise HTTPException(status_code=503, detail="Generation work could not be claimed.")
-        _start_project_pipeline(
-            (
-                db,
-                claim["work_id"],
-                claim["lease_owner"],
-                claim["lease_epoch"],
-                _output_dir(),
-            )
-        )
-    except Exception:
-        _generation_slots.release()
-        raise
+    _start_project_pipeline((db, work_id, "", 0, _output_dir()))
 
     response_project = PodcastProjectResponse(**project)
     return ProjectCreateResponse(
@@ -520,6 +529,7 @@ async def delete_project(project_id: str, owner_id: str = Depends(require_auth))
         deleted = await persistence.get_deleted_project(_db_path(), project_id)
         if deleted is None or deleted.get("owner_id") != owner_id:
             raise _project_not_found(project_id)
+        await _sweep_project_cleanup(project_id)
         return ProjectDeleteResponse(
             project_id=project_id,
             status="deleted",
@@ -529,9 +539,16 @@ async def delete_project(project_id: str, owner_id: str = Depends(require_auth))
     if project.get("owner_id") != owner_id:
         raise _project_not_found(project_id)
 
-    result = await persistence.delete_project(_db_path(), project_id)
+    result = await persistence.delete_project(
+        _db_path(), project_id, _cleanup_path_keys(project)
+    )
     if result is None:
         raise _project_not_found(project_id)
 
-    _remove_project_files(project)
-    return ProjectDeleteResponse(**result)
+    if _join_project_work(result.get("work_id")):
+        await _sweep_project_cleanup(project_id, _cleanup_path_keys(project))
+    return ProjectDeleteResponse(
+        project_id=result["project_id"],
+        status=result["status"],
+        deleted_at=result["deleted_at"],
+    )

@@ -84,6 +84,10 @@ def test_snapshot_tts_uses_bound_provider_and_voice(monkeypatch, tmp_path):
     output = tmp_path / "speech.mp3"
 
     result = segment_pipeline._synthesize_snapshot(
+        None,
+        None,
+        None,
+        None,
         "Verified text",
         snapshot,
         output,
@@ -113,6 +117,7 @@ def test_pipeline_uses_persisted_llm_snapshot(monkeypatch):
             "sme_profile": None,
             "llm_snapshot": snapshot,
             "tts_snapshot": _tts_snapshot(1),
+            "ledger_id": "ledger",
         },
     )
     monkeypatch.setattr(segment_pipeline, "_completed_result", lambda *_: None)
@@ -203,9 +208,8 @@ def _install_audio_fakes(monkeypatch, assembled_paths: list[str]) -> None:
     monkeypatch.setattr(segment_pipeline, "_sync_upsert_provenance", lambda *_: None)
   
 
-class TestParallelElevenLabsSegments:
+class TestProductionTTSSynthesis:
     def test_bounded_parallel_rendering_persists_each_plan_and_assembles_plan_order(self, monkeypatch, tmp_path):
-        from podcast_worker.core import tts_engine
 
         text = "Interviewer: Zero.\nInterviewer: One.\nInterviewer: Two."
         db_path, segment = _parallel_pipeline_db(tmp_path, text)
@@ -236,14 +240,14 @@ class TestParallelElevenLabsSegments:
                 with lock:
                     active["current"] -= 1
 
-        monkeypatch.setattr(tts_engine, "synthesize_elevenlabs_plan", synthesize)
+        monkeypatch.setattr(segment_pipeline, "synthesize_elevenlabs_plan", synthesize)
         worker_error = []
 
         def process():
             try:
-                segment_pipeline._process_segment(
-                    db_path, "project", segment, str(tmp_path), tmp_path / "beat.mp3",
-                    120, 1, None, "model", _tts_snapshot(2), "ledger",
+                segment_pipeline._synthesize_snapshot(
+                    db_path, "project", "segment", "ledger", text, _tts_snapshot(2),
+                    tmp_path / "speech_segment.mp3", namespace="project:segment",
                 )
             except Exception as exc:
                 worker_error.append(exc)
@@ -286,7 +290,6 @@ class TestParallelElevenLabsSegments:
         assert {entry[0].rsplit(":", 1)[-1] for entry in ledger_entries} == {"scene-0", "scene-1", "scene-2"}
 
     def test_maximum_one_is_sequential(self, monkeypatch, tmp_path):
-        from podcast_worker.core import tts_engine
 
         text = "Interviewer: Zero.\nInterviewer: One.\nInterviewer: Two."
         db_path, segment = _parallel_pipeline_db(tmp_path, text)
@@ -307,16 +310,15 @@ class TestParallelElevenLabsSegments:
                 with lock:
                     active["current"] -= 1
 
-        monkeypatch.setattr(tts_engine, "synthesize_elevenlabs_plan", synthesize)
-        segment_pipeline._process_segment(
-            db_path, "project", segment, str(tmp_path), tmp_path / "beat.mp3",
-            120, 1, None, "model", _tts_snapshot(1), "ledger",
+        monkeypatch.setattr(segment_pipeline, "synthesize_elevenlabs_plan", synthesize)
+        segment_pipeline._synthesize_snapshot(
+            db_path, "project", "segment", "ledger", text, _tts_snapshot(1),
+            tmp_path / "speech_segment.mp3", namespace="project:segment",
         )
         assert starts == ["project:segment:scene-0", "project:segment:scene-1", "project:segment:scene-2"]
         assert active["maximum"] == 1
 
     def test_dispatched_failure_marks_only_that_attempt_unknown_and_blocks_assembly(self, monkeypatch, tmp_path):
-        from podcast_worker.core import tts_engine
 
         text = "Interviewer: Zero.\nInterviewer: One.\nInterviewer: Two."
         db_path, segment = _parallel_pipeline_db(tmp_path, text)
@@ -329,11 +331,11 @@ class TestParallelElevenLabsSegments:
             dispatched.append(plan.plan_id)
             raise RoutingConfigurationError("tts_outcome_unknown")
 
-        monkeypatch.setattr(tts_engine, "synthesize_elevenlabs_plan", synthesize)
+        monkeypatch.setattr(segment_pipeline, "synthesize_elevenlabs_plan", synthesize)
         with pytest.raises(RoutingConfigurationError, match="tts_outcome_unknown"):
-            segment_pipeline._process_segment(
-                db_path, "project", segment, str(tmp_path), tmp_path / "beat.mp3",
-                120, 1, None, "model", _tts_snapshot(1), "ledger",
+            segment_pipeline._synthesize_snapshot(
+                db_path, "project", "segment", "ledger", text, _tts_snapshot(1),
+                tmp_path / "speech_segment.mp3", namespace="project:segment",
             )
 
         conn = sqlite3.connect(db_path)
