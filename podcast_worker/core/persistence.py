@@ -367,6 +367,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             project_id TEXT PRIMARY KEY,
             work_id TEXT,
             paths_json TEXT NOT NULL,
+            segment_ids_json TEXT NOT NULL DEFAULT '[]',
             created_at TEXT NOT NULL,
             last_attempt_at TEXT,
             attempts INTEGER NOT NULL DEFAULT 0
@@ -404,7 +405,12 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     }
     if "work_id" not in tombstone_columns:
         conn.execute("ALTER TABLE project_cleanup_tombstones ADD COLUMN work_id TEXT")
-    conn.execute("PRAGMA user_version = 5")
+    if "segment_ids_json" not in tombstone_columns:
+        conn.execute(
+            "ALTER TABLE project_cleanup_tombstones "
+            "ADD COLUMN segment_ids_json TEXT NOT NULL DEFAULT '[]'"
+        )
+    conn.execute("PRAGMA user_version = 6")
     conn.commit()
 
 
@@ -1275,7 +1281,10 @@ def _request_project_cancellation(
 
 
 def _delete_project(
-    db_path: str, project_id: str, cleanup_paths: list[str] | None = None,
+    db_path: str,
+    project_id: str,
+    cleanup_paths: list[str] | None = None,
+    cleanup_segment_ids: list[str] | None = None,
 ) -> dict | None:
     """Fence work, persist cleanup intent, then retire project metadata atomically."""
     conn = _get_conn(db_path)
@@ -1284,6 +1293,10 @@ def _delete_project(
     canonical_paths = sorted({
         Path(path).as_posix() for path in (cleanup_paths or [])
         if path and not Path(path).is_absolute() and ".." not in Path(path).parts
+    })
+    canonical_segment_ids = sorted({
+        segment_id for segment_id in (cleanup_segment_ids or [])
+        if isinstance(segment_id, str) and segment_id
     })
     conn.execute("BEGIN IMMEDIATE")
     try:
@@ -1306,12 +1319,14 @@ def _delete_project(
             ).fetchone()
             conn.execute(
                 """INSERT INTO project_cleanup_tombstones
-                   (project_id, work_id, paths_json, created_at)
-                   VALUES (?, ?, ?, ?)
+                   (project_id, work_id, paths_json, segment_ids_json, created_at)
+                   VALUES (?, ?, ?, ?, ?)
                    ON CONFLICT(project_id) DO NOTHING""",
                 (
                     project_id, pipeline["work_id"] if pipeline else None,
-                    json.dumps(canonical_paths), now,
+                    json.dumps(canonical_paths),
+                    json.dumps(canonical_segment_ids),
+                    now,
                 ),
             )
             conn.execute(
@@ -1367,14 +1382,42 @@ def _get_cleanup_tombstone(db_path: str, project_id: str) -> dict | None:
     conn = _get_conn(db_path)
     _ensure_schema(conn)
     row = conn.execute(
-        "SELECT work_id, paths_json FROM project_cleanup_tombstones WHERE project_id=?", (project_id,)
+        """SELECT work_id, paths_json, segment_ids_json
+           FROM project_cleanup_tombstones WHERE project_id=?""",
+        (project_id,),
     ).fetchone()
     if row is None:
         return None
     return {
-        "project_id": project_id, "work_id": row["work_id"],
+        "project_id": project_id,
+        "work_id": row["work_id"],
         "paths": json.loads(row["paths_json"]),
+        "segment_ids": json.loads(row["segment_ids_json"]),
     }
+def _list_cleanup_tombstones(db_path: str, work_id: str | None = None) -> list[dict]:
+    conn = _get_conn(db_path)
+    _ensure_schema(conn)
+    if work_id is None:
+        rows = conn.execute(
+            "SELECT project_id, work_id, paths_json, segment_ids_json "
+            "FROM project_cleanup_tombstones"
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            """SELECT project_id, work_id, paths_json, segment_ids_json
+               FROM project_cleanup_tombstones WHERE work_id=?""",
+            (work_id,),
+        ).fetchall()
+    return [
+        {
+            "project_id": row["project_id"],
+            "work_id": row["work_id"],
+            "paths": json.loads(row["paths_json"]),
+            "segment_ids": json.loads(row["segment_ids_json"]),
+        }
+        for row in rows
+    ]
+
 def _extend_cleanup_tombstone(
     db_path: str, project_id: str, cleanup_paths: list[str],
 ) -> None:
@@ -2011,11 +2054,24 @@ async def get_deleted_project(db_path: str, project_id: str) -> dict | None:
 
 
 async def delete_project(
-    db_path: str, project_id: str, cleanup_paths: list[str] | None = None,
+    db_path: str,
+    project_id: str,
+    cleanup_paths: list[str] | None = None,
+    cleanup_segment_ids: list[str] | None = None,
 ) -> dict | None:
-    return await _run_in_executor(_delete_project, db_path, project_id, cleanup_paths)
+    return await _run_in_executor(
+        _delete_project, db_path, project_id, cleanup_paths, cleanup_segment_ids
+    )
+
+
 async def get_cleanup_tombstone(db_path: str, project_id: str) -> dict | None:
     return await _run_in_executor(_get_cleanup_tombstone, db_path, project_id)
+
+
+async def list_cleanup_tombstones(db_path: str, work_id: str | None = None) -> list[dict]:
+    return await _run_in_executor(_list_cleanup_tombstones, db_path, work_id)
+
+
 async def extend_cleanup_tombstone(
     db_path: str, project_id: str, cleanup_paths: list[str],
 ) -> None:

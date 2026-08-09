@@ -44,11 +44,6 @@ def _patch_config(monkeypatch):
     monkeypatch.setattr(cfg, "elevenlabs_api_key", "test-elevenlabs-key")
     from podcast_worker.routers import v1_projects
 
-    monkeypatch.setattr(
-        v1_projects,
-        "_generation_slots",
-        threading.Semaphore(cfg.max_concurrent_generations),
-    )
 
     from podcast_worker.routers import v1_projects
 
@@ -72,7 +67,6 @@ def _patch_config(monkeypatch):
 
     def finish_without_worker(args):
         del args
-        v1_projects._generation_slots.release()
 
     monkeypatch.setattr(
         v1_projects, "generate_script_outline", deterministic_outline
@@ -340,7 +334,7 @@ class TestProjectsCRUD:
             assert terminal.status_code == 409
             assert terminal.json()["error"]["code"] == "project_not_cancellable"
         finally:
-            v1_projects._generation_slots.release()
+            pass
 
     def test_create_materializes_exact_plan_before_worker_start(
         self, client, auth_headers, monkeypatch
@@ -439,9 +433,9 @@ class TestProjectsCRUD:
             assert [
                 segment["segment_id"] for segment in detailed.json()["segments"]
             ] == segment_ids
-        finally:
-            v1_projects._generation_slots.release()
 
+        finally:
+            pass
     def test_outline_preview_returns_reviewable_plan(self, client, auth_headers, monkeypatch):
         from podcast_worker.routers import v1_projects
 
@@ -737,17 +731,25 @@ class TestProjectsCRUD:
         assert not output.exists()
         assert persistence._get_cleanup_tombstone(cfg.db_path, project_id) is None
 
-    def test_delete_defers_final_sweep_until_active_writer_exits(
+    def test_worker_exit_automatically_drains_late_tts_fragment(
         self, client, auth_headers, monkeypatch, tmp_path,
     ):
+        from podcast_worker import main
         from podcast_worker.core import persistence
         from podcast_worker.core.config import settings as cfg
-        from podcast_worker.routers import v1_projects
 
         monkeypatch.setattr(cfg, "output_dir", str(tmp_path))
         project_id = "prj_active_writer"
+        segment_id = "seg_owned_fragment"
         work_id = f"work_{uuid.uuid5(uuid.NAMESPACE_URL, f'{project_id}:pipeline').hex}"
         persistence._create_project(cfg.db_path, project_id, "single-user", "topic", 120, 5)
+        persistence._upsert_segment(cfg.db_path, {
+            "segment_id": segment_id,
+            "project_id": project_id,
+            "index": 0,
+            "subtopic": "topic",
+            "status": "pending",
+        })
         now = persistence._now_iso()
         connection = persistence._get_conn(cfg.db_path)
         connection.execute(
@@ -757,31 +759,37 @@ class TestProjectsCRUD:
             (work_id, project_id, now, now),
         )
         connection.commit()
-        persistence._add_artifact(cfg.db_path, {
-            "artifact_id": "art_active_writer", "project_id": project_id, "segment_id": None,
-            "kind": "final_mp3", "content_type": "audio/mpeg", "status": "ready",
-            "object_key": "writer.mp3", "download_url": "/api/v1/artifacts/art_active_writer",
-        })
         release = threading.Event()
+        started = threading.Event()
+        fragment = tmp_path / f"speech_{segment_id}-{project_id}:{segment_id}:fragment-0.mp3"
 
-        def active_writer():
+        def write_late_fragment(*_args):
+            started.set()
             release.wait()
-            (tmp_path / "writer.mp3").write_bytes(b"late")
+            fragment.write_bytes(b"late")
 
-        worker = threading.Thread(target=active_writer)
-        worker.start()
-        from podcast_worker import main
+        monkeypatch.setattr(main, "run_project_pipeline", write_late_fragment)
+        claim = {
+            "work_id": work_id,
+            "lease_owner": "test-worker",
+            "lease_epoch": 1,
+        }
+        with main.state.durable_work_lock:
+            main.state.durable_work_count += 1
+        worker = threading.Thread(target=main._run_durable_work, args=(claim,))
         with main.state.durable_work_lock:
             main.state.durable_work_threads[work_id] = worker
+        worker.start()
+        assert started.wait(timeout=1)
 
         assert client.delete(f"/api/v1/projects/{project_id}", headers=auth_headers).status_code == 200
         assert persistence._get_cleanup_tombstone(cfg.db_path, project_id) is not None
+        assert not fragment.exists()
+
         release.set()
-        worker.join()
-        assert client.delete(f"/api/v1/projects/{project_id}", headers=auth_headers).status_code == 200
-        assert not (tmp_path / "writer.mp3").exists()
-        with main.state.durable_work_lock:
-            main.state.durable_work_threads.pop(work_id, None)
+        worker.join(timeout=2)
+        assert not worker.is_alive()
+        assert not fragment.exists()
         assert persistence._get_cleanup_tombstone(cfg.db_path, project_id) is None
 
     def test_delete_nonexistent_project(self, client, auth_headers):

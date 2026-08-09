@@ -7,10 +7,10 @@ DELETE /api/v1/projects/{id}    — Delete project and artifacts
 """
 
 from __future__ import annotations
+import asyncio
 
 import hashlib
 import json
-import threading
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -46,7 +46,6 @@ from podcast_worker.core.models_v1 import (
 )
 
 router = APIRouter(prefix="/api/v1/projects", tags=["v1-projects"])
-_generation_slots = threading.Semaphore(settings.max_concurrent_generations)
 
 
 def _db_path() -> str:
@@ -59,15 +58,30 @@ def _output_dir() -> str:
         return str(configured)
     project_root = Path(__file__).resolve().parent.parent.parent
     return str(project_root / configured)
+def _is_safe_segment_id(segment_id: object) -> bool:
+    return (
+        isinstance(segment_id, str)
+        and bool(segment_id)
+        and all(character.isascii() and (character.isalnum() or character in "-_")
+                for character in segment_id)
+    )
+
+
 def _project_cleanup_paths(project: dict, output_dir: Path) -> list[Path]:
     """Enumerate only output names derivable from this project's own identifiers."""
     names = {f"final_{project['project_id']}.{suffix}" for suffix in ("mp3", "wav")}
     names.add(f"beat_{project['project_id']}.wav")
     for segment in project.get("segments", []):
         segment_id = segment["segment_id"]
+        if not _is_safe_segment_id(segment_id):
+            continue
         for stem in (f"speech_{segment_id}", f"mixed_{segment_id}"):
             names.update(f"{stem}.{suffix}" for suffix in ("mp3", "wav"))
         names.update(path.name for path in output_dir.glob(f"speech_{segment_id}-*.mp3"))
+        names.update(
+            (Path(".staging") / path.name).as_posix()
+            for path in (output_dir / ".staging").glob(f"speech_{segment_id}-*.mp3.*.part")
+        )
     names.update(
         artifact["object_key"]
         for artifact in project.get("artifacts", [])
@@ -93,19 +107,44 @@ def _cleanup_path_keys(project: dict) -> list[str]:
     ]
 
 
-async def _sweep_project_cleanup(
+def _cleanup_segment_ids(project: dict) -> list[str]:
+    return [
+        segment["segment_id"]
+        for segment in project.get("segments", [])
+        if _is_safe_segment_id(segment.get("segment_id"))
+    ]
+def _cleanup_fragment_paths(tombstone: dict, root: Path) -> list[str]:
+    """Discover only deterministic TTS fragment and staging names for owned segments."""
+    paths = []
+    staging = root / ".staging"
+    for segment_id in tombstone.get("segment_ids", []):
+        if not _is_safe_segment_id(segment_id):
+            continue
+        for candidate in root.glob(f"speech_{segment_id}-*.mp3"):
+            if candidate.is_file():
+                paths.append(candidate.relative_to(root).as_posix())
+        if staging.is_dir():
+            for candidate in staging.glob(f"speech_{segment_id}-*.mp3.*.part"):
+                if candidate.is_file():
+                    paths.append(candidate.relative_to(root).as_posix())
+    return paths
+
+
+def _sweep_project_cleanup_sync(
     project_id: str, cleanup_paths: list[str] | None = None,
 ) -> None:
     if cleanup_paths:
-        await persistence.extend_cleanup_tombstone(
-            _db_path(), project_id, cleanup_paths
-        )
-    tombstone = await persistence.get_cleanup_tombstone(_db_path(), project_id)
-    if tombstone is None:
-        return
-    if not _join_project_work(tombstone.get("work_id")):
+        persistence._extend_cleanup_tombstone(_db_path(), project_id, cleanup_paths)
+    tombstone = persistence._get_cleanup_tombstone(_db_path(), project_id)
+    if tombstone is None or not _join_project_work(tombstone.get("work_id")):
         return
     root = Path(_output_dir()).resolve()
+    discovered = _cleanup_fragment_paths(tombstone, root)
+    if discovered:
+        persistence._extend_cleanup_tombstone(_db_path(), project_id, discovered)
+        tombstone = persistence._get_cleanup_tombstone(_db_path(), project_id)
+        if tombstone is None:
+            return
     remaining = []
     for key in tombstone["paths"]:
         candidate = _safe_cleanup_path(root, key)
@@ -118,9 +157,19 @@ async def _sweep_project_cleanup(
             pass
         except OSError:
             remaining.append(key)
-    await persistence.record_cleanup_tombstone_result(
-        _db_path(), project_id, remaining
-    )
+    persistence._record_cleanup_tombstone_result(_db_path(), project_id, remaining)
+
+
+async def _sweep_project_cleanup(
+    project_id: str, cleanup_paths: list[str] | None = None,
+) -> None:
+    await asyncio.to_thread(_sweep_project_cleanup_sync, project_id, cleanup_paths)
+
+
+def drain_project_cleanup_tombstones(work_id: str | None = None) -> None:
+    """Drain cleanup owned by exited work, or every tombstone during startup."""
+    for tombstone in persistence._list_cleanup_tombstones(_db_path(), work_id):
+        _sweep_project_cleanup_sync(tombstone["project_id"])
 
 
 def _safe_cleanup_path(root: Path, key: str) -> Path | None:
@@ -540,7 +589,10 @@ async def delete_project(project_id: str, owner_id: str = Depends(require_auth))
         raise _project_not_found(project_id)
 
     result = await persistence.delete_project(
-        _db_path(), project_id, _cleanup_path_keys(project)
+        _db_path(),
+        project_id,
+        _cleanup_path_keys(project),
+        _cleanup_segment_ids(project),
     )
     if result is None:
         raise _project_not_found(project_id)

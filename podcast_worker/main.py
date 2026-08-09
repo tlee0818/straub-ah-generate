@@ -110,8 +110,9 @@ def _run_durable_work(claim: dict) -> None:
         with state.durable_work_lock:
             state.durable_work_count -= 1
             state.durable_work_threads.pop(work_id, None)
+        from podcast_worker.routers.v1_projects import drain_project_cleanup_tombstones
+        drain_project_cleanup_tombstones(work_id)
         _drain_durable_work()
-
 
 def _drain_durable_work(work_id: str | None = None) -> int:
     """Claim eligible durable work until the process-wide capacity is full."""
@@ -189,6 +190,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Application lifespan — startup/shutdown logic."""
     state.start_time = time.time()
     state.output_dir.mkdir(parents=True, exist_ok=True)
+    from podcast_worker.routers.v1_projects import drain_project_cleanup_tombstones
+    drain_project_cleanup_tombstones()
     state.durable_work_stop.clear()
     state.durable_work_wake.clear()
     state.durable_work_scheduler = threading.Thread(
