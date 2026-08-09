@@ -15,6 +15,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+import threading
 
 import numpy as np
 
@@ -36,6 +37,7 @@ from podcast_worker.core.tts_engine import (
     synthesize,
     synthesize_elevenlabs_plan,
 )
+from podcast_worker.core.observability import metrics
 
 
 class FenceLost(RuntimeError):
@@ -71,6 +73,11 @@ def _provider_operation(
         stage_name,
     )
     if attempt is None:
+        metrics.increment(
+            "podcast_fence_rejections_total",
+            operation="provider_reserve",
+            stage=stage_name,
+        )
         raise FenceLost("provider attempt reservation rejected")
     state = attempt["state"]
     if state == "completed":
@@ -85,9 +92,26 @@ def _provider_operation(
     if state != "reserved" or not persistence._mark_provider_attempt_dispatched(
         db_path, attempt["attempt_id"], work_id, owner, epoch
     ):
+        metrics.increment(
+            "podcast_fence_rejections_total",
+            operation="provider_dispatch",
+            stage=stage_name,
+        )
         raise FenceLost("provider dispatch fence rejected")
+    metrics.increment(
+        "podcast_provider_attempts_total",
+        stage=stage_name,
+        outcome="dispatched",
+    )
     try:
-        result = operation()
+        result = _with_lease_renewal(
+            db_path, work_id, owner, epoch, operation
+        )
+    except FenceLost:
+        persistence._fail_dispatched_attempt_unknown(
+            db_path, attempt["attempt_id"], work_id, owner, epoch
+        )
+        raise
     except Exception as exc:
         persistence._fail_dispatched_attempt_unknown(
             db_path, attempt["attempt_id"], work_id, owner, epoch
@@ -104,7 +128,17 @@ def _provider_operation(
     if not persistence._complete_provider_attempt(
         db_path, attempt["attempt_id"], work_id, owner, epoch, result
     ):
+        metrics.increment(
+            "podcast_fence_rejections_total",
+            operation="provider_complete",
+            stage=stage_name,
+        )
         raise FenceLost("provider result fence rejected")
+    metrics.increment(
+        "podcast_provider_attempts_total",
+        stage=stage_name,
+        outcome="completed",
+    )
     return result
 def _verification_payload(result) -> dict:
     if result.outcome == "blocked" or result.verified_text is None:
@@ -267,7 +301,17 @@ def _transition(
         db_path, work_id, owner, epoch, scope_id, stage, state, result, error_code
     )
     if not accepted:
+        metrics.increment(
+            "podcast_fence_rejections_total",
+            operation="stage_transition",
+            stage=stage,
+        )
         raise FenceLost(f"fence rejected {stage}/{scope_id}/{state}")
+    metrics.increment(
+        "podcast_generation_transitions_total",
+        stage=stage,
+        outcome=state,
+    )
 
 
 def _stage_row(db_path: str, project_id: str, scope_id: str, stage: str) -> sqlite3.Row:
@@ -291,10 +335,63 @@ def _completed_result(db_path: str, project_id: str, scope_id: str, stage: str) 
 
 
 def _renew(db_path: str, work_id: str, owner: str, epoch: int) -> None:
-    if not persistence._renew_work_lease(
+    renewed = persistence._renew_work_lease(
         db_path, work_id, owner, epoch, cfg.settings.work_lease_seconds
-    ):
+    )
+    metrics.increment(
+        "podcast_work_lease_events_total",
+        operation="renew",
+        outcome="renewed" if renewed else "rejected",
+    )
+    if not renewed:
+        metrics.increment(
+            "podcast_fence_rejections_total",
+            operation="lease_renew",
+        )
         raise FenceLost("work lease renewal failed")
+def _with_lease_renewal(
+    db_path: str, work_id: str, owner: str, epoch: int, operation
+):
+    """Renew a fenced lease while a blocking provider or audio operation runs."""
+    lost = threading.Event()
+    done = threading.Event()
+    interval = max(0.05, cfg.settings.work_lease_seconds / 3)
+
+    def heartbeat() -> None:
+        while not done.wait(interval):
+            renewed = persistence._renew_work_lease(
+                db_path, work_id, owner, epoch, cfg.settings.work_lease_seconds
+            )
+            metrics.increment(
+                "podcast_work_lease_events_total",
+                operation="renew",
+                outcome="renewed" if renewed else "rejected",
+            )
+            if not renewed:
+                metrics.increment(
+                    "podcast_fence_rejections_total",
+                    operation="lease_renew",
+                )
+                lost.set()
+                return
+
+    thread = threading.Thread(target=heartbeat, daemon=True, name=f"lease-{work_id}")
+    thread.start()
+    try:
+        result = operation()
+    finally:
+        done.set()
+        thread.join()
+    if lost.is_set():
+        raise FenceLost("work lease lost during blocking operation")
+    _renew(db_path, work_id, owner, epoch)
+    return result
+
+
+def _blocking_audio_operation(
+    db_path: str, work_id: str, owner: str, epoch: int, operation
+) -> None:
+    _with_lease_renewal(db_path, work_id, owner, epoch, operation)
 
 
 def _publish_verified_text(
@@ -367,10 +464,10 @@ def _publish_audio(
     epoch: int,
     segment_id: str,
     path: Path,
-    duration: float,
 ) -> None:
     artifact_id = _short_id("art")
     now = _now_iso()
+    duration = _validated_published_audio_duration(path)
     checksum = _sha256_file(path)
     if not path.is_file() or not path.stat().st_size or checksum is None:
         raise PipelineInvariantError("mixed audio failed validation")
@@ -401,6 +498,11 @@ def _publish_audio(
                  duration_seconds=?, updated_at=? WHERE segment_id=?""",
             (artifact_id, duration, now, segment_id),
         )
+        conn.execute(
+            """UPDATE projects SET status='partially_ready', updated_at=?
+               WHERE project_id=? AND status='queued'""",
+            (now, fence["project_id"]),
+        )
         result = json.dumps({"artifact_id": artifact_id, "checksum_sha256": checksum}, sort_keys=True)
         conn.execute(
             """UPDATE generation_stage_results SET state='completed', result_json=?,
@@ -420,6 +522,39 @@ def _publish_audio(
         raise
 
 
+def _validated_published_audio_duration(path: Path) -> float:
+    """Decode the exact MP3 being published and return its measured duration."""
+    if not path.is_file() or not path.stat().st_size:
+        raise PipelineInvariantError("mixed audio failed validation")
+    from pydub import AudioSegment
+
+    try:
+        audio = AudioSegment.from_file(path, format="mp3")
+    except Exception as exc:
+        raise PipelineInvariantError("mixed audio failed validation") from exc
+    if audio.frame_count() <= 0 or audio.frame_rate <= 0:
+        raise PipelineInvariantError("mixed audio failed validation")
+    return len(audio) / 1000.0
+
+def _observe_pipeline_health(db_path: str) -> None:
+    """Publish aggregate active-work and oldest-progress age without identifiers."""
+    conn = _connect(db_path)
+    row = conn.execute(
+        """SELECT COUNT(*) AS active_projects, MIN(g.last_transition_at) AS oldest_transition
+           FROM project_generation g
+           JOIN projects p ON p.project_id=g.project_id
+           WHERE g.disposition='active' AND p.deleted_at IS NULL"""
+    ).fetchone()
+    metrics.set("podcast_active_projects", float(row["active_projects"]))
+    oldest = row["oldest_transition"]
+    if oldest:
+        observed_at = datetime.fromisoformat(oldest)
+        staleness = max(0.0, (datetime.now(timezone.utc) - observed_at).total_seconds())
+    else:
+        staleness = 0.0
+    metrics.set("podcast_progress_staleness_seconds", staleness)
+
+
 def run_project_pipeline(
     db_path: str,
     work_id: str,
@@ -429,11 +564,14 @@ def run_project_pipeline(
 ) -> None:
     """Resume one claimed work item from committed durable stage results."""
     try:
+        _observe_pipeline_health(db_path)
         _run_pipeline(db_path, work_id, lease_owner, lease_epoch, output_dir)
     except FenceLost:
         _settle_cancellation(db_path, work_id, lease_owner, lease_epoch)
     except Exception as exc:
         _settle_failure(db_path, work_id, lease_owner, lease_epoch, exc)
+    finally:
+        _observe_pipeline_health(db_path)
 
 
 def _run_pipeline(db_path: str, work_id: str, owner: str, epoch: int, output_dir: str) -> None:
@@ -458,7 +596,12 @@ def _run_pipeline(db_path: str, work_id: str, owner: str, epoch: int, output_dir
     out.mkdir(parents=True, exist_ok=True)
     beat_path = out / f"beat_{project_id}.wav"
     if not beat_path.exists():
-        save_beat_to_wav(work["bpm"], work["duration_minutes"] * 60.0, str(beat_path))
+        _blocking_audio_operation(
+            db_path, work_id, owner, epoch,
+            lambda: save_beat_to_wav(
+                work["bpm"], work["duration_minutes"] * 60.0, str(beat_path)
+            ),
+        )
 
     previous_text = ""
     for segment, section in zip(hydrated["segments"], outline["sections"]):
@@ -530,18 +673,28 @@ def _run_pipeline(db_path: str, work_id: str, owner: str, epoch: int, output_dir
                 )
             },
         )
-        convert_to_wav(str(speech_mp3), str(speech_wav))
+        _blocking_audio_operation(
+            db_path, work_id, owner, epoch,
+            lambda: convert_to_wav(str(speech_mp3), str(speech_wav)),
+        )
         _transition(db_path, work_id, owner, epoch, segment_id, "tts", "completed",
                     {"assembled": True})
         _transition(db_path, work_id, owner, epoch, segment_id, "mixing", "running")
         mixed_wav = out / f"mixed_{segment_id}.wav"
         mixed_mp3 = out / f"mixed_{segment_id}.mp3"
-        build_podcast_audio(str(speech_wav), str(beat_path), str(mixed_wav),
-                            intro_seconds=2.0, outro_seconds=3.0, bpm=work["bpm"],
-                            duration_minutes=work["duration_minutes"])
-        convert_to_mp3(str(mixed_wav), str(mixed_mp3))
-        _publish_audio(db_path, work_id, owner, epoch, segment_id, mixed_mp3,
-                       float(segment.get("planned_duration_seconds") or 0))
+        _blocking_audio_operation(
+            db_path, work_id, owner, epoch,
+            lambda: build_podcast_audio(
+                str(speech_wav), str(beat_path), str(mixed_wav),
+                intro_seconds=2.0, outro_seconds=3.0, bpm=work["bpm"],
+                duration_minutes=work["duration_minutes"],
+            ),
+        )
+        _blocking_audio_operation(
+            db_path, work_id, owner, epoch,
+            lambda: convert_to_mp3(str(mixed_wav), str(mixed_mp3)),
+        )
+        _publish_audio(db_path, work_id, owner, epoch, segment_id, mixed_mp3)
 
     _finalize(db_path, work_id, owner, epoch, project_id, hydrated["segments"], out)
 
@@ -563,7 +716,10 @@ def _finalize(db_path: str, work_id: str, owner: str, epoch: int, project_id: st
     with wave.open(str(final_wav), "wb") as stream:
         stream.setnchannels(1); stream.setsampwidth(2); stream.setframerate(sample_rate)
         stream.writeframes(np.concatenate(arrays).tobytes())
-    convert_to_mp3(str(final_wav), str(final_mp3))
+    _blocking_audio_operation(
+        db_path, work_id, owner, epoch,
+        lambda: convert_to_mp3(str(final_wav), str(final_mp3)),
+    )
     if not final_mp3.is_file() or not final_mp3.stat().st_size:
         raise PipelineInvariantError("final audio failed validation")
     _publish_final_artifact(
@@ -573,7 +729,6 @@ def _finalize(db_path: str, work_id: str, owner: str, epoch: int, project_id: st
         epoch,
         project_id,
         final_mp3,
-        sum(len(array) for array in arrays) / sample_rate,
     )
 
 
@@ -584,10 +739,10 @@ def _publish_final_artifact(
     epoch: int,
     project_id: str,
     final_mp3: Path,
-    duration_seconds: float,
 ) -> None:
     """Atomically publish final audio, complete finalizing, and settle ready."""
     artifact_id = _short_id("art")
+    duration_seconds = _validated_published_audio_duration(final_mp3)
     checksum = _sha256_file(final_mp3)
     if checksum is None:
         raise PipelineInvariantError("final audio checksum failed")

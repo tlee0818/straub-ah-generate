@@ -6,6 +6,7 @@ POST /api/v1/artifacts/{artifact_id}/transfer-url — Refresh signed transfer UR
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -53,6 +54,13 @@ def _safe_output_path(out_dir: Path, filename: str) -> Path | None:
     except ValueError:
         return None
     return candidate
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for chunk in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -104,34 +112,48 @@ async def download_artifact(artifact_id: str, owner_id: str = Depends(require_au
                 ).model_dump(),
             )
 
-    # Locate the file on disk without allowing DB-contaminated ids to escape output_dir.
-    out_dir = Path(_output_dir())
-    content_type = artifact.get("content_type", "audio/mpeg")
-    media_type = content_type
-    candidate_names = [
-        f"mixed_{artifact.get('segment_id', '')}.mp3",
-        f"final_{project_id}.mp3",
-        f"speech_{artifact.get('segment_id', '')}.mp3",
-    ]
-
-    for name in candidate_names:
-        candidate = _safe_output_path(out_dir, name)
-        if candidate and candidate.exists() and candidate.is_file():
-            return FileResponse(
-                path=str(candidate),
-                media_type=media_type,
-                filename=f"{artifact_id}.mp3",
-            )
-
-    raise HTTPException(
-        status_code=404,
-        detail=ErrorEnvelope(
-            error=ErrorResponse(
-                code="not_found",
-                message="Artifact file not found on disk.",
+    # Serve only the artifact's persisted canonical object key.
+    object_key = artifact.get("object_key")
+    if not object_key:
+        raise HTTPException(
+            status_code=404,
+            detail=ErrorEnvelope(error=ErrorResponse(
+                code="not_found", message="Artifact file not found on disk.",
                 details={"artifact_id": artifact_id},
-            ),
-        ).model_dump(),
+            )).model_dump(),
+        )
+    out_dir = Path(_output_dir())
+    candidate = _safe_output_path(out_dir, object_key)
+    if candidate is None or not candidate.is_file():
+        raise HTTPException(
+            status_code=404,
+            detail=ErrorEnvelope(error=ErrorResponse(
+                code="not_found", message="Artifact file not found on disk.",
+                details={"artifact_id": artifact_id},
+            )).model_dump(),
+        )
+
+    expected_size = artifact.get("size_bytes")
+    expected_checksum = artifact.get("checksum_sha256")
+    if (
+        expected_size is None
+        or expected_checksum is None
+        or candidate.stat().st_size != expected_size
+        or _sha256_file(candidate) != expected_checksum
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail=ErrorEnvelope(error=ErrorResponse(
+                code="artifact_integrity_failed",
+                message="Artifact bytes failed integrity verification.",
+                details={"artifact_id": artifact_id},
+            )).model_dump(),
+        )
+
+    return FileResponse(
+        path=str(candidate),
+        media_type=artifact.get("content_type", "audio/mpeg"),
+        filename=f"{artifact_id}{candidate.suffix}",
     )
 
 

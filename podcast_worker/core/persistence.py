@@ -111,6 +111,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
             duration_seconds        REAL,
             size_bytes              INTEGER,
             checksum_sha256         TEXT,
+            object_key              TEXT,
             status                  TEXT NOT NULL DEFAULT 'pending',
             download_url            TEXT NOT NULL,
             signed_transfer_url     TEXT,
@@ -387,6 +388,9 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE segments ADD COLUMN segment_type TEXT NOT NULL DEFAULT 'content'")
     if "planned_duration_seconds" not in columns:
         conn.execute("ALTER TABLE segments ADD COLUMN planned_duration_seconds REAL")
+    artifact_columns = {row["name"] for row in conn.execute("PRAGMA table_info(artifacts)")}
+    if "object_key" not in artifact_columns:
+        conn.execute("ALTER TABLE artifacts ADD COLUMN object_key TEXT")
     conn.execute("PRAGMA user_version = 4")
     conn.commit()
 
@@ -896,7 +900,12 @@ def _renew_work_lease(
         """UPDATE project_pipeline
            SET lease_expires_at = ?, heartbeat_at = ?, updated_at = ?
            WHERE work_id = ? AND lease_owner = ? AND lease_epoch = ?
-             AND state = 'leased' AND lease_expires_at >= ?""",
+             AND state = 'leased' AND lease_expires_at >= ?
+             AND EXISTS (
+               SELECT 1 FROM project_generation g
+               WHERE g.project_id=project_pipeline.project_id
+                 AND g.disposition='active'
+             )""",
         (expires_at, now_iso, now_iso, work_id, lease_owner, lease_epoch, now_iso),
     )
     conn.commit()
@@ -1100,8 +1109,9 @@ def _fail_dispatched_attempt_unknown(
     try:
         conn.execute("BEGIN IMMEDIATE")
         attempt = conn.execute(
-            """SELECT a.*,w.project_id FROM provider_attempts a
+            """SELECT a.*,w.project_id,g.disposition FROM provider_attempts a
                JOIN project_pipeline w ON w.work_id=a.work_id
+               JOIN project_generation g ON g.project_id=w.project_id
                JOIN projects p ON p.project_id=w.project_id
                WHERE a.attempt_id=? AND a.work_id=? AND a.state='dispatched'
                  AND w.lease_owner=? AND w.lease_epoch=? AND w.state='leased'
@@ -1111,33 +1121,63 @@ def _fail_dispatched_attempt_unknown(
         if attempt is None:
             conn.rollback()
             return False
-        conn.execute(
-            "UPDATE provider_attempts SET state='failed_unknown',failed_at=? WHERE attempt_id=?",
-            (now, attempt_id),
-        )
-        conn.execute(
-            """UPDATE generation_stage_results SET state='failed',
-               safe_error_code='provider_outcome_unknown',updated_at=?
-               WHERE project_id=? AND scope_id=? AND stage_name=? AND state!='completed'""",
-            (now, attempt["project_id"], attempt["scope_id"], attempt["stage_name"]),
-        )
-        conn.execute(
-            "UPDATE project_pipeline SET state='failed',settled_at=?,updated_at=? WHERE work_id=?",
-            (now, now, work_id),
-        )
-        conn.execute(
-            """UPDATE project_generation SET disposition='terminal',
-               terminal_outcome='failed',terminal_at=?,last_transition_at=?,
-               progress_version=progress_version+1
-               WHERE project_id=? AND disposition='active'""",
-            (now, now, attempt["project_id"]),
-        )
-        conn.execute(
-            """UPDATE projects SET status=CASE WHEN EXISTS(
-               SELECT 1 FROM segments WHERE project_id=? AND status='ready')
-               THEN 'partially_ready' ELSE 'failed' END,updated_at=? WHERE project_id=?""",
-            (attempt["project_id"], now, attempt["project_id"]),
-        )
+        if attempt["disposition"] == "cancellation_requested":
+            conn.execute(
+                "UPDATE provider_attempts SET state='failed_unknown',failed_at=? WHERE attempt_id=?",
+                (now, attempt_id),
+            )
+            conn.execute(
+                """UPDATE generation_stage_results SET state='cancelled',cancelled_at=?,updated_at=?
+                   WHERE project_id=? AND state NOT IN ('completed','failed','cancelled')""",
+                (now, now, attempt["project_id"]),
+            )
+            conn.execute(
+                "UPDATE project_pipeline SET state='cancelled',settled_at=?,updated_at=? WHERE work_id=?",
+                (now, now, work_id),
+            )
+            conn.execute(
+                """UPDATE project_generation SET disposition='terminal',terminal_outcome='cancelled',
+                   cancellation_observed_at=?,terminal_at=?,last_transition_at=?,
+                   progress_version=progress_version+1 WHERE project_id=?""",
+                (now, now, now, attempt["project_id"]),
+            )
+            conn.execute(
+                """UPDATE projects SET status=CASE WHEN EXISTS(
+                   SELECT 1 FROM segments WHERE project_id=? AND status='ready')
+                   THEN 'partially_ready' ELSE 'failed' END,updated_at=? WHERE project_id=?""",
+                (attempt["project_id"], now, attempt["project_id"]),
+            )
+        elif attempt["disposition"] == "active":
+            conn.execute(
+                "UPDATE provider_attempts SET state='failed_unknown',failed_at=? WHERE attempt_id=?",
+                (now, attempt_id),
+            )
+            conn.execute(
+                """UPDATE generation_stage_results SET state='failed',
+                   safe_error_code='provider_outcome_unknown',updated_at=?
+                   WHERE project_id=? AND scope_id=? AND stage_name=? AND state!='completed'""",
+                (now, attempt["project_id"], attempt["scope_id"], attempt["stage_name"]),
+            )
+            conn.execute(
+                "UPDATE project_pipeline SET state='failed',settled_at=?,updated_at=? WHERE work_id=?",
+                (now, now, work_id),
+            )
+            conn.execute(
+                """UPDATE project_generation SET disposition='terminal',
+                   terminal_outcome='failed',terminal_at=?,last_transition_at=?,
+                   progress_version=progress_version+1
+                   WHERE project_id=? AND disposition='active'""",
+                (now, now, attempt["project_id"]),
+            )
+            conn.execute(
+                """UPDATE projects SET status=CASE WHEN EXISTS(
+                   SELECT 1 FROM segments WHERE project_id=? AND status='ready')
+                   THEN 'partially_ready' ELSE 'failed' END,updated_at=? WHERE project_id=?""",
+                (attempt["project_id"], now, attempt["project_id"]),
+            )
+        else:
+            conn.rollback()
+            return False
         conn.commit()
         return True
     except Exception:
@@ -1215,17 +1255,55 @@ def _request_project_cancellation(
 
 
 def _delete_project(db_path: str, project_id: str) -> dict | None:
+    """Fence publication and retire project-owned metadata atomically."""
     conn = _get_conn(db_path)
     _ensure_schema(conn)
     now = _now_iso()
-    cur = conn.execute(
-        "UPDATE projects SET status = 'deleted', deleted_at = ? WHERE project_id = ? AND deleted_at IS NULL",
-        (now, project_id),
-    )
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        row = conn.execute(
+            "SELECT deleted_at FROM projects WHERE project_id = ?", (project_id,)
+        ).fetchone()
+        if row is None:
+            result = None
+        elif row["deleted_at"] is not None:
+            result = {"project_id": project_id, "status": "deleted", "deleted_at": row["deleted_at"]}
+        else:
+            conn.execute(
+                """UPDATE projects
+                   SET status = 'deleted', deleted_at = ?, final_download_ready = 0,
+                       final_artifact_id = NULL, updated_at = ?
+                   WHERE project_id = ? AND deleted_at IS NULL""",
+                (now, now, project_id),
+            )
+            conn.execute(
+                """DELETE FROM execution_attempts
+                   WHERE plan_id IN (
+                       SELECT plan_id FROM tts_request_plans WHERE project_id = ?
+                   )""",
+                (project_id,),
+            )
+            conn.execute("DELETE FROM tts_request_plans WHERE project_id = ?", (project_id,))
+            conn.execute("DELETE FROM audio_assemblies WHERE project_id = ?", (project_id,))
+            conn.execute("DELETE FROM artifacts WHERE project_id = ?", (project_id,))
+            conn.execute("DELETE FROM segments WHERE project_id = ?", (project_id,))
+            result = {"project_id": project_id, "status": "deleted", "deleted_at": now}
+    except Exception:
+        conn.rollback()
+        raise
     conn.commit()
-    if cur.rowcount == 0:
-        return None
-    return {"project_id": project_id, "status": "deleted", "deleted_at": now}
+    return result
+
+
+def _get_deleted_project_by_id(db_path: str, project_id: str) -> dict | None:
+    conn = _get_conn(db_path)
+    _ensure_schema(conn)
+    row = conn.execute(
+        """SELECT project_id, owner_id, status, deleted_at FROM projects
+           WHERE project_id = ? AND deleted_at IS NOT NULL""",
+        (project_id,),
+    ).fetchone()
+    return dict(row) if row else None
 
 
 # ── Segment helpers ─────────────────────────────────────────────────────
@@ -1295,27 +1373,53 @@ def _upsert_provenance(db_path: str, segment_id: str, provenance: dict) -> None:
     conn.commit()
 
 
+def _canonical_object_key(artifact: dict) -> str:
+    """Return the one relative output key that may back this artifact."""
+    key = artifact.get("object_key")
+    if key:
+        candidate = Path(key)
+        if candidate.is_absolute() or ".." in candidate.parts:
+            raise ValueError("artifact object_key must be a safe relative path")
+        return candidate.as_posix()
+
+    project_id = artifact["project_id"]
+    kind = artifact["kind"]
+    if kind == "final_mp3":
+        return f"final_{project_id}.mp3"
+    if kind == "segment_audio" and artifact.get("segment_id"):
+        return f"mixed_{artifact['segment_id']}.mp3"
+    if kind == "script_json":
+        return f"script_{project_id}.json"
+    return f"artifact_{artifact['artifact_id']}"
+
+
 def _add_artifact(db_path: str, artifact: dict) -> None:
     conn = _get_conn(db_path)
     _ensure_schema(conn)
-    conn.execute(
-        """INSERT OR REPLACE INTO artifacts (artifact_id, project_id, segment_id,
+    object_key = _canonical_object_key(artifact)
+    cur = conn.execute(
+        """INSERT INTO artifacts (artifact_id, project_id, segment_id,
            kind, content_type, duration_seconds, size_bytes, checksum_sha256,
-           status, download_url, signed_transfer_url, signed_transfer_expires_at,
+           object_key, status, download_url, signed_transfer_url, signed_transfer_expires_at,
            created_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+           SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+           WHERE EXISTS (
+               SELECT 1 FROM projects WHERE project_id = ? AND deleted_at IS NULL
+           )""",
         (
             artifact["artifact_id"], artifact["project_id"],
             artifact.get("segment_id"), artifact["kind"],
             artifact["content_type"], artifact.get("duration_seconds"),
-            artifact.get("size_bytes"), artifact.get("checksum_sha256"),
+            artifact.get("size_bytes"), artifact.get("checksum_sha256"), object_key,
             artifact["status"], artifact["download_url"],
             artifact.get("signed_transfer_url"),
             artifact.get("signed_transfer_expires_at"),
-            artifact.get("created_at", _now_iso()),
+            artifact.get("created_at", _now_iso()), artifact["project_id"],
         ),
     )
     conn.commit()
+    if cur.rowcount != 1:
+        raise ValueError("cannot publish artifact for a deleted or unknown project")
 
 
 def _get_artifact_by_id(db_path: str, artifact_id: str) -> dict | None:
@@ -1705,6 +1809,7 @@ def _row_to_artifact(row: sqlite3.Row) -> dict:
         "duration_seconds": row["duration_seconds"],
         "size_bytes": row["size_bytes"],
         "checksum_sha256": row["checksum_sha256"],
+        "object_key": row["object_key"],
         "status": row["status"],
         "download_url": row["download_url"],
         "signed_transfer_url": row["signed_transfer_url"],
@@ -1779,6 +1884,9 @@ async def list_projects(db_path: str, owner_id: str) -> list[dict]:
 
 async def get_project(db_path: str, project_id: str) -> dict | None:
     return await _run_in_executor(_get_project_by_id, db_path, project_id)
+async def get_deleted_project(db_path: str, project_id: str) -> dict | None:
+    return await _run_in_executor(_get_deleted_project_by_id, db_path, project_id)
+
 
 
 async def delete_project(db_path: str, project_id: str) -> dict | None:

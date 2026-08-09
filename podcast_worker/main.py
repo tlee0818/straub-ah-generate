@@ -79,6 +79,8 @@ class AppState:
         self.jobs: dict[str, dict] = {}
         # In-memory script store
         self.scripts: dict[str, dict] = {}
+        self.durable_work_lock = threading.Lock()
+        self.durable_work_count = 0
         # Default output directory, configurable for container deployments.
         configured_output_dir = Path(cfg.settings.output_dir)
         if configured_output_dir.is_absolute():
@@ -87,34 +89,57 @@ class AppState:
             project_root = Path(__file__).resolve().parent.parent
             self.output_dir = project_root / configured_output_dir
 
-
 state = AppState()
 
 
-def _start_one_durable_work(work_id: str | None = None) -> bool:
-    """Claim and launch at most one pending/expired durable work item."""
-    owner = f"worker_{uuid.uuid4().hex}"
-    claim = persistence._claim_next_work(
-        cfg.settings.db_path,
-        owner,
-        cfg.settings.work_lease_seconds,
-        work_id,
-    )
-    if claim is None:
-        return False
-    threading.Thread(
-        target=run_project_pipeline,
-        args=(
+def _run_durable_work(claim: dict) -> None:
+    try:
+        run_project_pipeline(
             cfg.settings.db_path,
             claim["work_id"],
             claim["lease_owner"],
             claim["lease_epoch"],
             str(state.output_dir),
-        ),
-        daemon=True,
-        name=f"pipeline-{claim['work_id']}",
-    ).start()
-    return True
+        )
+    finally:
+        with state.durable_work_lock:
+            state.durable_work_count -= 1
+        _drain_durable_work()
+
+
+def _drain_durable_work(work_id: str | None = None) -> int:
+    """Continuously claim eligible recovery work while local capacity remains."""
+    started = 0
+    while True:
+        with state.durable_work_lock:
+            if state.durable_work_count >= cfg.settings.max_concurrent_generations:
+                return started
+            state.durable_work_count += 1
+        owner = f"worker_{uuid.uuid4().hex}"
+        claim = persistence._claim_next_work(
+            cfg.settings.db_path,
+            owner,
+            cfg.settings.work_lease_seconds,
+            work_id,
+        )
+        if claim is None:
+            with state.durable_work_lock:
+                state.durable_work_count -= 1
+            return started
+        threading.Thread(
+            target=_run_durable_work,
+            args=(claim,),
+            daemon=True,
+            name=f"pipeline-{claim['work_id']}",
+        ).start()
+        started += 1
+        if work_id is not None:
+            return started
+
+
+def _start_one_durable_work(work_id: str | None = None) -> bool:
+    """Compatibility wrapper for one explicit durable work launch."""
+    return _drain_durable_work(work_id) > 0
 
 
 # ---------------------------------------------------------------------------
@@ -127,7 +152,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """Application lifespan — startup/shutdown logic."""
     state.start_time = time.time()
     state.output_dir.mkdir(parents=True, exist_ok=True)
-    _start_one_durable_work()
+    _drain_durable_work()
     yield
     # Cleanup on shutdown (if needed)
 

@@ -60,6 +60,40 @@ def _output_dir() -> str:
         return str(configured)
     project_root = Path(__file__).resolve().parent.parent.parent
     return str(project_root / configured)
+def _project_cleanup_paths(project: dict, output_dir: Path) -> list[Path]:
+    """Enumerate only output names derivable from this project's own identifiers."""
+    names = {f"final_{project['project_id']}.{suffix}" for suffix in ("mp3", "wav")}
+    names.add(f"beat_{project['project_id']}.wav")
+    for segment in project.get("segments", []):
+        segment_id = segment["segment_id"]
+        for stem in (f"speech_{segment_id}", f"mixed_{segment_id}"):
+            names.update(f"{stem}.{suffix}" for suffix in ("mp3", "wav"))
+        names.update(path.name for path in output_dir.glob(f"speech_{segment_id}-*.mp3"))
+    names.update(
+        artifact["object_key"]
+        for artifact in project.get("artifacts", [])
+        if artifact.get("object_key")
+    )
+    root = output_dir.resolve()
+    paths = []
+    for name in names:
+        candidate = (root / name).resolve()
+        try:
+            candidate.relative_to(root)
+        except ValueError:
+            continue
+        paths.append(candidate)
+    return paths
+
+
+def _remove_project_files(project: dict) -> None:
+    for path in _project_cleanup_paths(project, Path(_output_dir())):
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+
+
 
 
 def _routing_error(exc: RoutingConfigurationError, pair: bool = False) -> HTTPException:
@@ -270,13 +304,9 @@ async def create_project(
     """Atomically create a durable project before scheduling generation."""
     project_id = _short_id("prj")
     db = _db_path()
-    if not _generation_slots.acquire(blocking=False):
-        raise HTTPException(status_code=503, detail="Generation capacity is full.")
-
     outline = _outline_response_to_generator(req.approved_outline)
     outline_preview_id = req.outline_preview_id
     if outline is None or outline_preview_id is None:
-        _generation_slots.release()
         raise HTTPException(
             status_code=409,
             detail=ErrorEnvelope(
@@ -294,7 +324,6 @@ async def create_project(
     validate_profile_pair(llm_snapshot, tts_snapshot)
     persisted_preview = persistence._get_preview_binding(db, outline_preview_id, owner_id)
     if persisted_preview is None:
-        _generation_slots.release()
         raise HTTPException(
             status_code=409,
             detail=ErrorEnvelope(
@@ -304,6 +333,8 @@ async def create_project(
                 )
             ).model_dump(),
         )
+    if not _generation_slots.acquire(blocking=False):
+        raise HTTPException(status_code=503, detail="Generation capacity is full.")
     try:
         project = await persistence.create_progress_project(
             db,
@@ -336,24 +367,27 @@ async def create_project(
 
     work_id = f"work_{uuid.uuid5(uuid.NAMESPACE_URL, f'{project_id}:pipeline').hex}"
     lease_owner = _short_id("worker")
-    claim = await persistence.claim_next_work(
-        db,
-        lease_owner,
-        settings.work_lease_seconds,
-        work_id,
-    )
-    if claim is None:
-        _generation_slots.release()
-        raise HTTPException(status_code=503, detail="Generation work could not be claimed.")
-    _start_project_pipeline(
-        (
+    try:
+        claim = await persistence.claim_next_work(
             db,
-            claim["work_id"],
-            claim["lease_owner"],
-            claim["lease_epoch"],
-            _output_dir(),
+            lease_owner,
+            settings.work_lease_seconds,
+            work_id,
         )
-    )
+        if claim is None:
+            raise HTTPException(status_code=503, detail="Generation work could not be claimed.")
+        _start_project_pipeline(
+            (
+                db,
+                claim["work_id"],
+                claim["lease_owner"],
+                claim["lease_epoch"],
+                _output_dir(),
+            )
+        )
+    except Exception:
+        _generation_slots.release()
+        raise
 
     response_project = PodcastProjectResponse(**project)
     return ProjectCreateResponse(
@@ -481,20 +515,23 @@ async def cancel_project(project_id: str, owner_id: str = Depends(require_auth))
 @router.delete("/{project_id}", response_model=ProjectDeleteResponse)
 async def delete_project(project_id: str, owner_id: str = Depends(require_auth)):
     """Delete the project and its retained artifacts."""
-    # Verify ownership first
-    project = await _load_owned_project(project_id, owner_id)
+    project = await persistence.get_project(_db_path(), project_id)
+    if project is None:
+        deleted = await persistence.get_deleted_project(_db_path(), project_id)
+        if deleted is None or deleted.get("owner_id") != owner_id:
+            raise _project_not_found(project_id)
+        return ProjectDeleteResponse(
+            project_id=project_id,
+            status="deleted",
+            deleted_at=deleted["deleted_at"],
+        )
+
+    if project.get("owner_id") != owner_id:
+        raise _project_not_found(project_id)
 
     result = await persistence.delete_project(_db_path(), project_id)
     if result is None:
-        raise HTTPException(
-            status_code=404,
-            detail=ErrorEnvelope(
-                error=ErrorResponse(
-                    code="not_found",
-                    message="Project not found.",
-                    details={"project_id": project_id},
-                ),
-            ).model_dump(),
-        )
+        raise _project_not_found(project_id)
 
+    _remove_project_files(project)
     return ProjectDeleteResponse(**result)

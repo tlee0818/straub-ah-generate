@@ -457,3 +457,60 @@ class TestVerificationGate:
             )
         assert any("factfulness" in call for call in calls)
         assert not any("tts" in call.lower() for call in calls)
+def test_transition_and_fence_metrics_are_emitted(monkeypatch):
+    from podcast_worker.core.observability import metrics
+
+    metrics.reset()
+    monkeypatch.setattr(
+        segment_pipeline.persistence, "_record_stage_transition", lambda *_args: True
+    )
+    segment_pipeline._transition(
+        "db", "work", "owner", 1, "segment", "mixing", "completed"
+    )
+    assert (
+        'podcast_generation_transitions_total{outcome="completed",stage="mixing"} 1'
+        in metrics.render()
+    )
+
+    monkeypatch.setattr(
+        segment_pipeline.persistence, "_record_stage_transition", lambda *_args: False
+    )
+    with pytest.raises(segment_pipeline.FenceLost):
+        segment_pipeline._transition(
+            "db", "work", "owner", 1, "segment", "mixing", "running"
+        )
+    assert (
+        'podcast_fence_rejections_total{operation="stage_transition",stage="mixing"} 1'
+        in metrics.render()
+    )
+
+def test_provider_and_lease_metrics_are_emitted(monkeypatch):
+    from podcast_worker.core.observability import metrics
+
+    metrics.reset()
+    monkeypatch.setattr(
+        segment_pipeline.persistence,
+        "_reserve_provider_attempt",
+        lambda *_args: {
+            "attempt_id": "attempt",
+            "project_id": "project",
+            "state": "reserved",
+        },
+    )
+    monkeypatch.setattr(
+        segment_pipeline.persistence, "_mark_provider_attempt_dispatched", lambda *_args: True
+    )
+    monkeypatch.setattr(
+        segment_pipeline.persistence, "_complete_provider_attempt", lambda *_args: True
+    )
+    monkeypatch.setattr(
+        segment_pipeline.persistence, "_renew_work_lease", lambda *_args: True
+    )
+
+    assert segment_pipeline._provider_operation(
+        "db", "work", "owner", 1, "operation", "segment", "tts", lambda: {"ok": True}
+    ) == {"ok": True}
+    rendered = metrics.render()
+    assert 'podcast_provider_attempts_total{outcome="dispatched",stage="tts"} 1' in rendered
+    assert 'podcast_provider_attempts_total{outcome="completed",stage="tts"} 1' in rendered
+    assert 'podcast_work_lease_events_total{operation="renew",outcome="renewed"} 1' in rendered

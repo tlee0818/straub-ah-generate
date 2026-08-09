@@ -1,9 +1,10 @@
 import sqlite3
+import threading
 
 import pytest
 
 from podcast_worker.core import persistence
-from podcast_worker.core.segment_pipeline import FenceLost, _provider_operation
+from podcast_worker.core.segment_pipeline import FenceLost, _provider_operation, _with_lease_renewal
 
 
 def _leased_project(tmp_path):
@@ -118,3 +119,63 @@ def test_provider_crash_fails_unknown_and_cannot_replay_after_restart(tmp_path):
     with pytest.raises(FenceLost):
         _provider_operation(*args)
     assert calls == 1
+def test_ambiguous_provider_attempt_prefers_requested_cancellation(tmp_path):
+    db_path, claim = _leased_project(tmp_path)
+    attempt = persistence._reserve_provider_attempt(
+        db_path,
+        claim["work_id"],
+        claim["lease_owner"],
+        claim["lease_epoch"],
+        "lead_research",
+        "project",
+        "research",
+    )
+    assert attempt is not None
+    assert persistence._mark_provider_attempt_dispatched(
+        db_path,
+        attempt["attempt_id"],
+        claim["work_id"],
+        claim["lease_owner"],
+        claim["lease_epoch"],
+    )
+    assert persistence._request_project_cancellation(
+        db_path, "prj_provider", "single-user"
+    ) is not None
+
+    assert persistence._fail_dispatched_attempt_unknown(
+        db_path,
+        attempt["attempt_id"],
+        claim["work_id"],
+        claim["lease_owner"],
+        claim["lease_epoch"],
+    )
+
+    connection = sqlite3.connect(db_path)
+    generation = connection.execute(
+        "SELECT disposition, terminal_outcome FROM project_generation WHERE project_id='prj_provider'"
+    ).fetchone()
+    pipeline = connection.execute(
+        "SELECT state FROM project_pipeline WHERE work_id=?", (claim["work_id"],)
+    ).fetchone()
+    connection.close()
+    assert generation == ("terminal", "cancelled")
+    assert pipeline == ("cancelled",)
+def test_blocking_operation_discards_result_when_lease_renewal_is_lost(monkeypatch):
+    renewal_attempted = threading.Event()
+    monkeypatch.setattr(
+        persistence,
+        "_renew_work_lease",
+        lambda *_args: renewal_attempted.set() and False,
+    )
+    monkeypatch.setattr(
+        "podcast_worker.core.segment_pipeline.cfg.settings.work_lease_seconds", 0.01
+    )
+
+    with pytest.raises(FenceLost, match="lost during blocking operation"):
+        _with_lease_renewal(
+            "unused.db",
+            "work",
+            "owner",
+            1,
+            lambda: renewal_attempted.wait(1),
+        )

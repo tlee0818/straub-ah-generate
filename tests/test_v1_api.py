@@ -770,6 +770,51 @@ class TestArtifacts:
 
         assert client.get("/api/v1/artifacts/art_internal", headers=auth_headers).status_code == 404
         assert client.post("/api/v1/artifacts/art_internal/transfer-url", headers=auth_headers).status_code == 404
+    def test_artifact_serves_only_verified_canonical_key(self, client, auth_headers, monkeypatch, tmp_path):
+        import hashlib
+
+        from podcast_worker.core import persistence
+        from podcast_worker.core.config import settings as cfg
+
+        monkeypatch.setattr(cfg, "output_dir", str(tmp_path))
+        payload = b"verified artifact bytes"
+        (tmp_path / "owned.mp3").write_bytes(payload)
+        (tmp_path / "mixed_seg_verified.mp3").write_bytes(b"wrong bytes")
+        persistence._create_project(cfg.db_path, "prj_verified", "single-user", "topic", 120, 5)
+        persistence._add_artifact(cfg.db_path, {
+            "artifact_id": "art_verified", "project_id": "prj_verified",
+            "segment_id": "seg_verified", "kind": "segment_audio",
+            "content_type": "audio/mpeg", "status": "ready",
+            "size_bytes": len(payload), "checksum_sha256": hashlib.sha256(payload).hexdigest(),
+            "object_key": "owned.mp3", "download_url": "/api/v1/artifacts/art_verified",
+        })
+
+        response = client.get("/api/v1/artifacts/art_verified", headers=auth_headers)
+
+        assert response.status_code == 200
+        assert response.content == payload
+
+    def test_artifact_integrity_mismatch_is_not_served(self, client, auth_headers, monkeypatch, tmp_path):
+        import hashlib
+
+        from podcast_worker.core import persistence
+        from podcast_worker.core.config import settings as cfg
+
+        monkeypatch.setattr(cfg, "output_dir", str(tmp_path))
+        (tmp_path / "final_prj_corrupt.mp3").write_bytes(b"changed")
+        persistence._create_project(cfg.db_path, "prj_corrupt", "single-user", "topic", 120, 5)
+        persistence._add_artifact(cfg.db_path, {
+            "artifact_id": "art_corrupt", "project_id": "prj_corrupt",
+            "segment_id": None, "kind": "final_mp3", "content_type": "audio/mpeg",
+            "status": "ready", "size_bytes": 8,
+            "checksum_sha256": hashlib.sha256(b"expected").hexdigest(),
+            "download_url": "/api/v1/artifacts/art_corrupt",
+        })
+
+        response = client.get("/api/v1/artifacts/art_corrupt", headers=auth_headers)
+
+        assert response.status_code == 409
+        assert response.json()["error"]["code"] == "artifact_integrity_failed"
 
 
 # ── Durability ────────────────────────────────────────────────────────────
