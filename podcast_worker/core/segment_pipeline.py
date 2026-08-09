@@ -488,10 +488,10 @@ def _publish_audio(
         conn.execute(
             """INSERT INTO artifacts
                (artifact_id,project_id,segment_id,kind,content_type,duration_seconds,
-                size_bytes,checksum_sha256,status,download_url,created_at)
-               VALUES (?,?,?,'segment_audio','audio/mpeg',?,?,?,'ready',?,?)""",
+                size_bytes,checksum_sha256,object_key,status,download_url,created_at)
+               VALUES (?,?,?,'segment_audio','audio/mpeg',?,?,?,?, 'ready',?,?)""",
             (artifact_id, fence["project_id"], segment_id, duration, path.stat().st_size,
-             checksum, f"/api/v1/artifacts/{artifact_id}", now),
+             checksum, path.name, f"/api/v1/artifacts/{artifact_id}", now),
         )
         conn.execute(
             """UPDATE segments SET status='ready', primary_audio_artifact_id=?,
@@ -766,14 +766,15 @@ def _publish_final_artifact(
         conn.execute(
             """INSERT INTO artifacts
                (artifact_id,project_id,segment_id,kind,content_type,duration_seconds,
-                size_bytes,checksum_sha256,status,download_url,created_at)
-               VALUES (?,?,NULL,'final_mp3','audio/mpeg',?, ?,?,'ready',?,?)""",
+                size_bytes,checksum_sha256,object_key,status,download_url,created_at)
+               VALUES (?,?,NULL,'final_mp3','audio/mpeg',?,?,?,?, 'ready',?,?)""",
             (
                 artifact_id,
                 project_id,
                 duration_seconds,
                 final_mp3.stat().st_size,
                 checksum,
+                final_mp3.name,
                 f"/api/v1/artifacts/{artifact_id}",
                 now,
             ),
