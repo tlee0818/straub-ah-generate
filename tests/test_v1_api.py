@@ -739,8 +739,8 @@ class TestProjectsCRUD:
         from podcast_worker.core.config import settings as cfg
 
         monkeypatch.setattr(cfg, "output_dir", str(tmp_path))
-        project_id = "prj_active_writer"
-        segment_id = "seg_owned_fragment"
+        project_id = "prj_0123456789ab"
+        segment_id = "seg_0123456789abcdef0123456789abcdef"
         work_id = f"work_{uuid.uuid5(uuid.NAMESPACE_URL, f'{project_id}:pipeline').hex}"
         persistence._create_project(cfg.db_path, project_id, "single-user", "topic", 120, 5)
         persistence._upsert_segment(cfg.db_path, {
@@ -791,6 +791,33 @@ class TestProjectsCRUD:
         assert not worker.is_alive()
         assert not fragment.exists()
         assert persistence._get_cleanup_tombstone(cfg.db_path, project_id) is None
+
+    def test_delete_does_not_select_prefix_extension_tts_fragment(
+        self, client, auth_headers, monkeypatch, tmp_path,
+    ):
+        from podcast_worker.core import persistence
+        from podcast_worker.core.config import settings as cfg
+
+        monkeypatch.setattr(cfg, "output_dir", str(tmp_path))
+        project_id = "prj_abcdef012345"
+        segment_id = "seg_abcdef0123456789abcdef0123456789"
+        foreign_segment_id = f"{segment_id}f"
+        owned = tmp_path / f"speech_{segment_id}-{project_id}:{segment_id}:fragment-0.mp3"
+        foreign = tmp_path / f"speech_{foreign_segment_id}-foreign-plan.mp3"
+        owned.write_bytes(b"owned")
+        foreign.write_bytes(b"foreign")
+        persistence._create_project(cfg.db_path, project_id, "single-user", "topic", 120, 5)
+        persistence._upsert_segment(cfg.db_path, {
+            "segment_id": segment_id,
+            "project_id": project_id,
+            "index": 0,
+            "subtopic": "topic",
+            "status": "pending",
+        })
+
+        assert client.delete(f"/api/v1/projects/{project_id}", headers=auth_headers).status_code == 200
+        assert not owned.exists()
+        assert foreign.exists()
 
     def test_delete_nonexistent_project(self, client, auth_headers):
         resp = client.delete("/api/v1/projects/prj_fake", headers=auth_headers)

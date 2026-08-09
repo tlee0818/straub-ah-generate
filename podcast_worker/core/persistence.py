@@ -56,6 +56,14 @@ def _get_conn(db_path: str) -> sqlite3.Connection:
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
+def _is_canonical_segment_id(segment_id: object) -> bool:
+    return (
+        isinstance(segment_id, str)
+        and len(segment_id) == 36
+        and segment_id.startswith("seg_")
+        and all(character in "0123456789abcdef" for character in segment_id[4:])
+    )
+
 
 def _ensure_schema(conn: sqlite3.Connection) -> None:
     conn.executescript("""
@@ -1296,7 +1304,7 @@ def _delete_project(
     })
     canonical_segment_ids = sorted({
         segment_id for segment_id in (cleanup_segment_ids or [])
-        if isinstance(segment_id, str) and segment_id
+        if _is_canonical_segment_id(segment_id)
     })
     conn.execute("BEGIN IMMEDIATE")
     try:

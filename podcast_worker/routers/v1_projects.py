@@ -59,11 +59,20 @@ def _output_dir() -> str:
     project_root = Path(__file__).resolve().parent.parent.parent
     return str(project_root / configured)
 def _is_safe_segment_id(segment_id: object) -> bool:
+    """Accept only the UUID5-derived segment IDs produced by persistence."""
     return (
         isinstance(segment_id, str)
-        and bool(segment_id)
-        and all(character.isascii() and (character.isalnum() or character in "-_")
-                for character in segment_id)
+        and len(segment_id) == 36
+        and segment_id.startswith("seg_")
+        and all(character in "0123456789abcdef" for character in segment_id[4:])
+    )
+
+def _is_safe_project_id(project_id: object) -> bool:
+    return (
+        isinstance(project_id, str)
+        and len(project_id) == 16
+        and project_id.startswith("prj_")
+        and all(character in "0123456789abcdef" for character in project_id[4:])
     )
 
 
@@ -77,11 +86,15 @@ def _project_cleanup_paths(project: dict, output_dir: Path) -> list[Path]:
             continue
         for stem in (f"speech_{segment_id}", f"mixed_{segment_id}"):
             names.update(f"{stem}.{suffix}" for suffix in ("mp3", "wav"))
-        names.update(path.name for path in output_dir.glob(f"speech_{segment_id}-*.mp3"))
-        names.update(
-            (Path(".staging") / path.name).as_posix()
-            for path in (output_dir / ".staging").glob(f"speech_{segment_id}-*.mp3.*.part")
-        )
+        if _is_safe_project_id(project["project_id"]):
+            fragment_prefix = f"speech_{segment_id}-{project['project_id']}:{segment_id}:"
+            names.update(
+                path.name for path in output_dir.glob(f"{fragment_prefix}*.mp3")
+            )
+            names.update(
+                (Path(".staging") / path.name).as_posix()
+                for path in (output_dir / ".staging").glob(f"{fragment_prefix}*.mp3.*.part")
+            )
     names.update(
         artifact["object_key"]
         for artifact in project.get("artifacts", [])
@@ -117,14 +130,18 @@ def _cleanup_fragment_paths(tombstone: dict, root: Path) -> list[str]:
     """Discover only deterministic TTS fragment and staging names for owned segments."""
     paths = []
     staging = root / ".staging"
+    project_id = tombstone["project_id"]
+    if not _is_safe_project_id(project_id):
+        return []
     for segment_id in tombstone.get("segment_ids", []):
         if not _is_safe_segment_id(segment_id):
             continue
-        for candidate in root.glob(f"speech_{segment_id}-*.mp3"):
+        fragment_prefix = f"speech_{segment_id}-{project_id}:{segment_id}:"
+        for candidate in root.glob(f"{fragment_prefix}*.mp3"):
             if candidate.is_file():
                 paths.append(candidate.relative_to(root).as_posix())
         if staging.is_dir():
-            for candidate in staging.glob(f"speech_{segment_id}-*.mp3.*.part"):
+            for candidate in staging.glob(f"{fragment_prefix}*.mp3.*.part"):
                 if candidate.is_file():
                     paths.append(candidate.relative_to(root).as_posix())
     return paths
